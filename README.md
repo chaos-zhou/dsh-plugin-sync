@@ -118,6 +118,16 @@ hub 只做字节中转（`/v1/ping`、`/v1/index`、`/v1/blob`），不解析 DS
 
 因此强烈建议遵守约束：**同一个会话只在一台设备上继续**。在 A 上打开过的会话，切到 B 前先等一轮同步完成（或调 `dsh_sync_now`）。如果确实两边都写了，去 `plugin-sync/conflicts/` 找回另一边的版本，手工取舍。
 
+## 工作区索引兼容性
+
+`storages/workspace.json` 是 DSH 的核心索引文件，插件合并它时遵循以下守则（v1.0.1 起生效）：
+
+- **无损合并**：合并结果保留本地文件的**全部键**——包括 `global.initialized`、`unit` 信封和任何未知字段（未来 DSH 版本新增的字段原样保留）。只对 `workspaceIds` / `archivedSessionIds` / `pinnedSessionIds` / `sessionIds` 做并集更新，绝不新建对象整体替换 `global` / `tables` / workspace 条目。
+- **写盘前校验**：对带 `unit: {name:'workspace', version:2}` 信封的文件，写入前先按 schema 校验（`global.initialized` 为 boolean、三个 id 数组、`defaultWorkspaceId` 为 string；每个 workspace 的 `path`/`title`/`createdAt`/`updatedAt` 为 string、`sessionIds` 为字符串数组）。校验失败 → **不写任何文件**，本地字节保持不变，返回 `{merged:false, error}` 并写 error 日志。旧格式文件（无 `unit` 信封）不做强校验，仅做无损合并。
+- **远端数据视为不可信输入**：staging 里的 `workspace/workspace.json` 可能是对端或旧版本写坏的文件。远端缺 `initialized` 等字段时由本地补齐；远端独有的 workspace 缺必需字段时跳过该条目并记 error（其余合法部分照常合并）；类型不合法的远端值一律不采纳，坏 JSON 直接忽略。
+- **版本守卫**：任一方 `unit.version` 不是数字或 `!== 2` 时拒绝合并（日志 warn、返回 skipped），绝不改写文件。
+- **备份与回滚**：内容确有变化才写盘；写本地前先在同目录写 `workspace.json.bak-<YYYYMMDD-HHMMSS>`（最多保留 5 个），写入后重新读回并再次校验，失败即用备份恢复原文件并报错。
+
 ## 工具
 
 | 工具 | 参数 | 说明 |
@@ -140,10 +150,11 @@ hub 只做字节中转（`/v1/ping`、`/v1/index`、`/v1/blob`），不解析 DS
 ## 测试
 
 ```bash
-node tests/engine.test.mjs
+node tests/engine.test.mjs        # 端到端同步：初始同步、工作区并集、冲突、幂等零流量
+node tests/workspace.compat.test.mjs  # workspace.json 兼容性：无损合并、写盘前校验、版本守卫、备份回滚、幂等
 ```
 
-用两个临时 `dshHome` 起两个 engine（互为 peer），覆盖初始同步、工作区并集、两端同改冲突、幂等零流量四类场景，成功输出 `ALL PASS`。
+两个测试成功均输出 `ALL PASS`。
 
 ## 通过 Plugin Manager 安装（推荐，不要手动改 profile 文件）
 
