@@ -110,3 +110,21 @@ v1.2.2 修复（见 `FIX-SPEC-v1.2.2.md`）：
 - [ ] 幂等：连续两轮 `dsh_sync_now`，第二轮 `registryApplied` 的 created/sessions/archived/pinned 为 0；
 - [ ] 降级：临时移除 registry 服务注入后，`workspaceWriteMode` 回到 `'proposal'` 且行为同 v1.1.2；
 - [ ] 宿主文件 sha256 记录：启用前 ________ / 启用后 ________（应仅由宿主自身操作引起变化）。
+
+
+---
+
+# v1.3.2 验收（2026-11-04）
+
+## 交付
+- registry 模式：通过宿主 `workspaceRegistry` 事务 API 自动应用工作区索引（create/resolveByPath/attachSession/archiveSession/pinSession），**插件不写宿主索引文件**。
+- 跨系统路径：`pathRemap` 只在 applier 使用路径时映射一次；本机已存在路径不映射（防反馈膨胀）；规则严格校验（绝对路径、无点段、拒绝 UNC/根规则、映射结果复验）。
+- Codex 六轮复审（v1.2→v1.3.2）：最新一轮**无 BLOCKER**，仅 5 条 NIT（诊断文案/测试可移植性）。
+- 7 套测试全 PASS；真实 staging（Windows 路径）+ 真实 remap + mock registry：本机路径不映射、远端映射一次、attach 6 会话、零 error。
+- GitHub：main `ddb111c`、tag `v1.3.2`。
+
+## 线上验证（Mac 端，插件已启用）
+- `workspaceWriteMode: "registry"`、`registryAvailable: true`、监听 `0.0.0.0:8789`。
+- 一轮 cycle：`pulled 2 / pushed 2 / applied 2 / merged 2 / errors 0`；`registryApplied.workspaces = 2`（两个工作区均解析到本机路径，跨系统映射成功）。
+- 待办：宿主尚未识别新同步的 2 个会话文件 → 重启 DSH 后自动 attach（插件会给 warning 并在下一轮重试）。
+- 对端需升级到 v1.3.2 才能同样自动应用工作区索引。
