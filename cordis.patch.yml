@@ -1,0 +1,16 @@
+- insert:
+    - id: dsh-plugin-sync
+      name: 'dsh-plugin-sync'
+      config:
+        deviceName: ''
+        role: 'peer'
+        listenPort: 8789
+        token: ''
+        peers: []
+        hubUrl: ''
+        intervalSec: 300
+        settleSec: 120
+        dshHome: ''
+        pathRemap: []
+        applyConfig: false
+        autoApply: true

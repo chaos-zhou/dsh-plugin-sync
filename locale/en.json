@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "DSH Sync",
+    "description": "Sync sessions, attachments and workspace indexes between devices over LAN or through a hub server."
+  }
+}
