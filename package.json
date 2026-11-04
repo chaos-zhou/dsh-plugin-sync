@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-sync",
-  "version": "1.0.0",
+  "version": "1.1.2",
   "private": true,
   "type": "module",
   "description": "跨设备同步 DSH 会话、附件与工作区索引：局域网点对点，或经一个 hub 服务器中转。",

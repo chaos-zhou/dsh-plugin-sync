@@ -2,6 +2,12 @@
 
 DSH 多端同步插件：在两台（或多台）安装了 DSH 的设备之间同步**会话、附件、摘要缓存、工作区索引**，可选同步插件配置。局域网内点对点直连，或经一台 hub 服务器中转。**零依赖**，只使用 Node 内置模块（Node >= 20），复制目录即可安装。
 
+> **v1.1 行为变化**：工作区索引不再写宿主 `storages/workspace.json`，也不再使用宿主 `storageDomain` 服务——合并结果只生成建议文件，等待宿主事务 API 或人工应用。会话/附件/摘要缓存自动同步不受影响，详见「工作区索引写入模式」。
+>
+> **v1.1.1 安全收口**：新增统一写防护层 `lib/safe-writer.js`，插件所有落盘路径（含日志、state、blob）都经过符号链接/边界校验；`<dshHome>/storages` 本身为符号链接时判定危险配置并拒绝一切写入。详见「路径边界防护」。
+>
+> **v1.1.2 安全补强**：日志追加/轮转增加硬链接防护（目标 `nlink>1` 拒绝，打开后 `fstat` 复核），日志拒绝不再静默而是计入本轮 `errors[]`；目录创建收敛到 `guardedMkdir`（`plugin-sync` 或 `storages` 被符号链接劫持时初始化零创建）；safe-writer 全部内部异常转为结构化拒绝。同时如实声明防护能力边界（`O_NOFOLLOW` 只保护最后一级、校验与 `rename` 之间存在 TOCTOU 窗口），详见「路径边界防护」。
+
 ## 安装
 
 ### 本机（第一台设备）
@@ -34,7 +40,7 @@ DSH 多端同步插件：在两台（或多台）安装了 DSH 的设备之间�
 
 3. 重启 DSH。默认每 300 秒自动同步一轮；也可在会话里让模型调用 `dsh_sync_now` 立即同步。
 
-两台设备互为 peer：每轮同步会导出本地数据 → 推给对方 → 拉取对方的新数据 → 落回本地，之后双方数据一致。
+两台设备互为 peer：每轮同步会导出本地数据 → 推给对方 → 拉取对方的新数据 → 校验并落回；工作区写入方式及会话冲突处理见下文。
 
 ## 配置字段
 
@@ -51,7 +57,7 @@ DSH 多端同步插件：在两台（或多台）安装了 DSH 的设备之间�
 | `settleSec` | `120` | 文件“安静期”：会话/摘要缓存 mtime 距今超过该秒数才导出，避免同步正在写入的文件 |
 | `dshHome` | `~/.dsh` | DSH 数据目录 |
 | `pathRemap` | `[]` | 工作区路径映射 `[{from, to}]`（字符串替换），用于把远端工作区路径翻译成本机路径 |
-| `applyConfig` | `false` | 是否把远端的 `config/<profile>/cordis.patch.yml` 写回本机 `profiles/<profile>/` |
+| `applyConfig` | `false` | 暂停配置自动落回；即使设置为 `true` 也只记警告，配置仍可导出 |
 | `autoApply` | `true` | 保留字段（落回行为由 apply 规则控制） |
 
 配置持久化在 `<dshHome>/plugin-sync/config.json`；可用 `dsh_sync_config` 工具在线修改（`listenPort`/`role`/`bindHost` 变更需要重启，其余字段下一轮自动生效）。
@@ -89,7 +95,7 @@ hub 只做字节中转（`/v1/ping`、`/v1/index`、`/v1/blob`），不解析 DS
 - **token 必填**：除 `/v1/ping` 外所有接口都校验 `x-dsh-sync-token`。token 为空时服务**只绑定 `127.0.0.1`** 并在日志警告——局域网设备无法连入，但仍可在本机自测。
 - 请生成足够长的随机 token（例如 `openssl rand -hex 24`），并只写在本机配置文件里；`dsh_sync_status` / `dsh_sync_config` 返回的 token 一律打码（前 6 位 + `******`）。
 - 会话与附件可能包含敏感内容，请只在可信网络内同步；跨公网使用请自建隧道（如 WireGuard/SSH 隧道）后再指向 hub。
-- 请求体上限 200MB，所有响应带 `cache-control: no-store`。
+- 单 blob 和服务端请求体上限 200MiB，peer index 响应上限 16MiB、最多 100000 条；超限拒收并计入 cycle 的 `errors`。客户端超时覆盖整个响应体读取。所有响应带 `cache-control: no-store`。
 
 ## 同步什么、不同步什么
 
@@ -100,10 +106,10 @@ hub 只做字节中转（`/v1/ping`、`/v1/index`、`/v1/blob`），不解析 DS
 | 会话 | `sessions/<cwdDir>/<sid>/session.v4.jsonl.zstd(或 .zst)` | 同名路径 |
 | 附件 | `attachments/**` | 同名路径 |
 | 摘要缓存 | `storages/session_projcache/sessions/*.json` | `projcache/sessions/*.json` |
-| 插件配置 | `profiles/*/cordis.patch.yml` | `config/<profile>/cordis.patch.yml`（默认不写回，需 `applyConfig: true`） |
-| 工作区索引 | `storages/workspace.json` | `workspace/workspace.json`（只做三方合并，永不整文件覆盖） |
+| 插件配置 | `profiles/*/cordis.patch.yml` | `config/<profile>/cordis.patch.yml`（保留导出，暂停自动写回） |
+| 工作区索引 | 只读参考宿主 `storages/workspace.json` | `workspace/workspace.json`（无损合并，只生成建议，不写宿主） |
 
-**从不传输**：`plugin-sync/`（自身数据）、`node_modules/`、`electron/`、`speech-to-text/`、`cache/`、`llm-deepseek/`、`.credentials.yaml`、`.anonymous-user-id`、所有 `*.lock` 文件。所有落盘都先写 `*.tmp-<pid>` 再原子 rename，对端不会读到半个文件。
+**从不传输**：`plugin-sync/`（自身数据）、`node_modules/`、`electron/`、`speech-to-text/`、`cache/`、`llm-deepseek/`、`.credentials.yaml`、`.anonymous-user-id`、所有 `*.lock` 文件。已知落盘统一经 `lib/safe-writer.js`（含目录创建与日志，见「路径边界防护」）：先以 `O_CREAT|O_EXCL|O_NOFOLLOW` 创建 `.tmp-<basename>.<pid>.<rand>` 临时文件，再原子 rename 到目标，对端不会读到半个文件。
 
 ## 冲突与“同一会话只在一台继续”
 
@@ -111,50 +117,82 @@ hub 只做字节中转（`/v1/ping`、`/v1/index`、`/v1/blob`），不解析 DS
 
 但**会话内容本身不做合并**。落回规则：
 
-- 对端有、本地没有 → 复制过来；
+- 对端有、本地没有且无未解决冲突 → 校验后复制过来；
+- 无基线且内容不同（包括 `state.json` 缺失或损坏）→ 保留本地，对端存冲突副本；接收时间不参与新旧判断；
 - 本地改了、对端没改 → 保留本地（下轮自动推给对方）；
 - 对端改了、本地没改 → 采用对端；
 - **两端都改了同一会话** → 保留本地，对端版本存入 `<dshHome>/plugin-sync/conflicts/`（文件名含路径与设备名、时间戳）并在日志 warn。
+- 冲突记录保存到 `state.json` 的 `unresolvedConflict`，包含会话 id 及两侧哈希。后续周期、重启以及远端再次修改都不能自动覆盖；确认两侧内容一致后清除记录，或手工解决后清除对应记录。
+
+会话落回前检查哈希、完整 zstd 帧，以 `node:zlib` 有界解压（输出最多 200MiB）并逐行解析 JSONL。坏帧、坏 JSONL 或运行时没有 zstd 解压能力时，都保存冲突副本、记录 error 并跳过，保留本地。Node 20 可运行插件，但通常没有原生 zstd 解压能力；会话自动落回需要提供该能力的 Node 版本。摘要缓存必须通过 JSON 解析，并落回 `storages/session_projcache/sessions/`。
 
 因此强烈建议遵守约束：**同一个会话只在一台设备上继续**。在 A 上打开过的会话，切到 B 前先等一轮同步完成（或调 `dsh_sync_now`）。如果确实两边都写了，去 `plugin-sync/conflicts/` 找回另一边的版本，手工取舍。
 
-## 工作区索引兼容性
+## 工作区索引写入模式
 
-`storages/workspace.json` 是 DSH 的核心索引文件，插件合并它时遵循以下守则（v1.0.1 起生效）：
+v1.1 起**只有 proposal 模式**：插件绝不写宿主 `storages/workspace.json`，也不再请求注入宿主 `storageDomain` 服务。合并结果只写入 `<dataDir>/proposed/workspace.json`（`dataDir` 为 `<dshHome>/plugin-sync`），另写一份 `staging/workspace/workspace.json` 副本随同步推给对端；应用到宿主需等宿主提供事务 API 或人工处理。
 
-- **无损合并**：合并结果保留本地文件的**全部键**——包括 `global.initialized`、`unit` 信封和任何未知字段（未来 DSH 版本新增的字段原样保留）。只对 `workspaceIds` / `archivedSessionIds` / `pinnedSessionIds` / `sessionIds` 做并集更新，绝不新建对象整体替换 `global` / `tables` / workspace 条目。
-- **写盘前校验**：对带 `unit: {name:'workspace', version:2}` 信封的文件，写入前先按 schema 校验（`global.initialized` 为 boolean、三个 id 数组、`defaultWorkspaceId` 为 string；每个 workspace 的 `path`/`title`/`createdAt`/`updatedAt` 为 string、`sessionIds` 为字符串数组）。校验失败 → **不写任何文件**，本地字节保持不变，返回 `{merged:false, error}` 并写 error 日志。旧格式文件（无 `unit` 信封）不做强校验，仅做无损合并。
-- **远端数据视为不可信输入**：staging 里的 `workspace/workspace.json` 可能是对端或旧版本写坏的文件。远端缺 `initialized` 等字段时由本地补齐；远端独有的 workspace 缺必需字段时跳过该条目并记 error（其余合法部分照常合并）；类型不合法的远端值一律不采纳，坏 JSON 直接忽略。
-- **版本守卫**：任一方 `unit.version` 不是数字或 `!== 2` 时拒绝合并（日志 warn、返回 skipped），绝不改写文件。
-- **备份与回滚**：内容确有变化才写盘；写本地前先在同目录写 `workspace.json.bak-<YYYYMMDD-HHMMSS>`（最多保留 5 个），写入后重新读回并再次校验，失败即用备份恢复原文件并报错。
+为什么取消 domain 写路径：宿主 domain 只有 get/set/put/delete/update，没有事务/CAS/版本号 API。v1.1 之前的方案是「快照 → 逐条 put → global.set」的读改写——put 等待期间宿主一旦更新工作区/置顶，最后的 global.set 会用旧快照的合并结果整体覆盖宿主新数据，插件侧无法安全修复，因此整条路径移除（即使外部代码传入 domain 句柄，插件也只记 warning 并忽略）。
+
+| 项目 | 行为 |
+|---|---|
+| 读取 | 宿主 `storages/workspace.json` 只读（32MiB 有界三态读取）；解析失败/读取失败中止合并；缺失时按既有建议/远端继续合并（本地缺失时仅接受完整合法远端）。绝不写宿主文件 |
+| 写入 | `<dataDir>/proposed/workspace.json` 与 `<dataDir>/staging/workspace/workspace.json`，经 `lib/safe-writer.js` 先写 `O_NOFOLLOW` 独占临时文件再原子 rename |
+| 状态 | `workspaceWriteMode: 'proposal'`（恒定）、`proposalPending`、`proposalPath`、`proposalPathSafe`，建议持续保留并在每轮 `warnings[]` 提示 |
+
+**路径边界防护（v1.1.2，统一 safe-writer）**：插件的已知落盘路径（proposal、staging、日志、state.json、config.json、blob、目录创建、会话/附件/摘要缓存落回）都收敛到 `lib/safe-writer.js` 的统一防护层（仓库内有 grep 自检佐证，见 FIX-REPORT）：
+
+1. **数据目录边界**：init 时 `assertSafeRoot(dataDir)` 校验插件数据目录本身不在宿主 `storages/` 内；若 `<dshHome>/storages` 本身是符号链接（含悬空），判定为危险配置，**拒绝一切写入与目录创建**（config 播种、日志、proposal、state 全部拒绝），错误计入 `errors[]`。
+2. **目录创建（`guardedMkdir`）**：插件所有目录创建统一走 `guardedMkdir`——创建前校验最近已存在祖先的真实目录链（任何一级是符号链接即拒绝，包括 `plugin-sync` 本身被劫持），`storages` 为符号链接/悬空别名时拒绝创建（别名不会被初始化激活）；逐级创建后 `realpath` 复核仍在合法范围内。
+3. **祖先链校验**：每次写入从文件系统根逐级 `lstat` 走到目标父目录，任何一级是符号链接即拒绝；缺失父目录逐级创建并在创建后 `realpath` 复核仍在 root 之内。
+4. **目标文件校验**：目标已存在且是符号链接（含悬空）→ 拒绝；临时文件以 `O_CREAT|O_EXCL|O_NOFOLLOW` 创建；rename 之后 `lstat`+`realpath` 复核目标是普通文件且解析后仍位于 root 内。注意：`O_NOFOLLOW` 只保护**打开时的最后一级路径组件**，不防护父目录链。
+5. **硬链接防护（v1.1.2）**：日志追加（`guardedAppend`）与轮转（`guardedRotate`）在操作前 `lstat` 拒绝 `nlink>1` 的目标（防止 `sync.log` 是宿主 `storages/workspace.json` 的硬链接时，追加/轮转直接修改宿主同一 inode）；打开后再次 `fstat` 复核 `nlink===1`，防「校验后、打开前」被替换为硬链接的窗口。
+6. **本轮拒绝缓存**：同一轮 cycle 内被拒绝的写目标（含日志目标）不再重试（错误含「不再重试」），避免逐 peer 重复试探；直接调用（如测试）使用独立 round 键，修复文件系统后可重试。
+7. **落回专属禁点**：`assertApplyTarget` 对会话/附件落回额外检查父级符号链接；摘要缓存合法写入 `storages/session_projcache/sessions/`，但父目录不得是符号链接、目标不得解析为 `storages/workspace.json`。
+
+**失败契约与拒绝语义（如实）**：safe-writer 的任何内部异常（`realpath`/`lstat`/`stat` 的 EACCES/EIO/ELOOP 等）都捕获并转为结构化拒绝 `{ok:false, code, error}`，不向调用方抛出、不在失败后同轮重试；写后父目录 `realpath` 失败/无法确认边界时按**失败**返回（内容可能已落盘，以返回的错误为准）。被拒绝的目标（符号链接/硬链接/越界/危险配置）不会创建或修改文件，临时文件已清理；I/O 中途失败则可能留下已创建的目标或部分内容。写入失败计入本轮 `errors[]`；**日志与日志轮转被拒绝时不再静默**，同样计入 `errors[]`；**proposal 目标**被拒时置 `proposalPathSafe: false`，staging 副本被拒不影响该标志。
+
+**残余风险（TOCTOU 窗口，如实声明）**：`lstat`/`realpath` 校验与最终 `rename`/追加之间存在理论竞态窗口——攻击者若能在校验通过后的瞬间替换中间目录或目标，防护可能被绕过；写后复核只能**发现**该窗口内的替换并报错，不能阻止或回滚宿主侧的并发改动。彻底消除需要 openat2/RESOLVE_BENEATH 级内核支持，Node 无对应 API。`tests/security.symlink.test.mjs` 用 `tests/.tmp` 里的真实符号链接/硬链接构造了 14 组攻击（staging/workspace→storages、悬空 storages 别名、sync.log→宿主 workspace.json 符号链接与硬链接、staging 根为链接、plugin-sync→storages 初始化污染、lstat/realpath 故障注入等），并断言宿主字节不变、零写系统调用。
+
+合并规则（与写入模式无关，始终适用）：
+
+- **无损合并**：保留本地递归键集、`global.initialized` 和未知字段；未知对象同名值保留本地，远端只补缺；`__proto__`、`constructor` 等键按自有键安全处理。`workspaceIds` / `sessionIds` 保序并集，title/path 按 `updatedAt` 选择。
+- **写前校验**：完整 v2 信封、必需字段、`workspaceIds` 属于结果表以及 default 引用完整。远端坏条目跳过并记录 error，对应索引过滤；缺失字段可由合法本地补齐。本地缺失时仅接受完整合法远端。解析失败、I/O 故障、版本不符或合并结果非法均拒写。
+- **容量边界**：每个工作区输入与合并产物最多 32MiB；workspace 表、workspaceIds 和各 sessionIds 数组最多 100000 条。输入或结果超限都报错并拒写，不再截断后写入。
+
+升级注意（v1.0 → v1.1）：不再自动应用工作区索引，`dsh_sync_status` 恒显示 `proposal`；无需手工赋予插件宿主文件写权限。建议文件每轮参与合并故不会丢失，但长期不接入宿主事务 API 时工作区索引不会落盘到宿主。旧版插件产生的宿主文件备份不会被新代码自动恢复或清理。
 
 ## 工具
 
 | 工具 | 参数 | 说明 |
 |---|---|---|
-| `dsh_sync_status` | 无 | 设备、监听地址/端口、peers、会话数量（local/staged）、冲突数、`lastRun`/`lastResult`/`nextRun`、是否同步中 |
-| `dsh_sync_now` | 无 | 立即执行一轮同步，返回本轮摘要 `{exported, pulled, pushed, applied, conflicts, merged, errors[]}` |
+| `dsh_sync_status` | 无 | 设备、监听地址/端口、peers、会话数量、写入模式、建议状态/路径/路径安全（`proposalPathSafe`）、冲突数、最近一轮结果及下次运行时间 |
+| `dsh_sync_now` | 无 | 立即同步，返回计数、`workspaceWriteMode`、`proposalPending` / `proposalPath` / `proposalPathSafe`、`errors[]` 和 `warnings[]` |
 | `dsh_sync_config` | `{set?}` | 无 `set` 返回当前设置（token 打码）；有 `set` 深合并写入 `config.json`，返回 `{settings, needRestart}` |
 
 ## 日志与排查
 
-- 追加日志：`<dshHome>/plugin-sync/logs/sync.log`，超过 2MB 轮转为 `sync.log.1`。
+- 追加日志：`<dshHome>/plugin-sync/logs/sync.log`，超过 2MB 轮转为 `sync.log.1`。日志文件本身被符号链接/硬链接劫持、或 `storages` 为危险配置时，追加与轮转被 safe-writer 拒绝，拒绝信息计入本轮 `errors[]`（不再静默）。
 - 单个 peer 失败不影响其他 peer，错误会进本轮摘要的 `errors[]` 并写日志；整个 cycle 的任何异常都被捕获，不会抛到宿主。
 - 常见问题：
   - **连不上**：确认双方 token 一致、`listenPort` 没被防火墙拦截、`peers[].url` 用对方的局域网 IP；
   - **401**：token 不匹配（注意 hub 与客户端要用同一个 token）；
   - **文件一直不同步**：看 mtime 是否仍在新写入（`settleSec` 安静期未过）；DSH 的 flock 锁不影响同步——只看 mtime，不看锁；
   - **端口被占**：改 `listenPort`，或设为 `0` 用随机端口（在 `dsh_sync_status` 里看实际端口）。
-- 状态基线在 `plugin-sync/state.json`（localHashes / remoteHashes / declined / pushed）；手工删掉它会让插件重新建立基线。
+- 状态基线在 `plugin-sync/state.json`（localHashes / remoteHashes / declined / unresolvedConflict / pushed）。先处理 `conflicts/` 的副本再清除对应冲突记录；删掉整个 state 会丢失基线，下次内容不同仍会走无基线冲突保护。
 
 ## 测试
 
 ```bash
-node tests/engine.test.mjs        # 端到端同步：初始同步、工作区并集、冲突、幂等零流量
-node tests/workspace.compat.test.mjs  # workspace.json 兼容性：无损合并、写盘前校验、版本守卫、备份回滚、幂等
+node tests/engine.test.mjs        # 端到端同步：初始同步、工作区建议并集、冲突、幂等零流量
+node tests/workspace.compat.test.mjs  # 无损合并、校验/容量拒写、真实符号链接攻击、宿主只读
+node tests/apply.compat.test.mjs      # 跨周期冲突保护、坏zstd/JSONL、缓存校验、配置拒绝自动落回
+node tests/engine.offline.test.mjs    # 沙箱补充：真实文件与周期，内存 fetch 响应，不能代替 HTTP 验收
+node tests/fixture.accept.test.mjs    # 读取 /tmp/dsh-sync-accept 两份事故 fixture，在仓库临时目录合并
+node tests/security.symlink.test.mjs  # 14 组攻击：符号链接/硬链接/目录污染/故障注入，宿主字节不变、零写系统调用
 ```
 
-两个测试成功均输出 `ALL PASS`。
+各测试成功均输出 `ALL PASS`；HTTP 测试需要允许本机端口监听。
 
 ## 通过 Plugin Manager 安装（推荐，不要手动改 profile 文件）
 
