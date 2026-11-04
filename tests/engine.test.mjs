@@ -89,21 +89,9 @@ function wsFor(sessionId, title, updatedAt) {
   }
 }
 
-// 模拟宿主已打开 domain；测试读写均局限内存，宿主文件仅作只读哨兵。
-function mockDomain(initial) {
-  let value = structuredClone(initial)
-  const table = {
-    get: (id) => structuredClone(value.tables.workspaces[id]),
-    entries: () => Object.entries(structuredClone(value.tables.workspaces))[Symbol.iterator](),
-    get size() { return Object.keys(value.tables.workspaces).length },
-    async put(id, entry) { value.tables.workspaces = Object.fromEntries([...Object.entries(value.tables.workspaces).filter(([key]) => key !== id), [id, structuredClone(entry)]]) },
-  }
-  return {
-    name: 'workspace',
-    global: { get: () => structuredClone(value.global), async set(global) { value.global = structuredClone(global) } },
-    table: (name) => { assert.strictEqual(name, 'workspaces'); return table },
-    document: () => structuredClone(value),
-  }
+// v1.1：插件不再使用宿主 domain；宿主 storages/workspace.json 只作只读本地输入与哨兵。
+async function readProposal(home) {
+  return JSON.parse(await fsp.readFile(path.join(home, 'plugin-sync', 'proposed', 'workspace.json'), 'utf8'))
 }
 
 async function testStateRecovery() {
@@ -125,8 +113,7 @@ async function testStateRecovery() {
       if (stateBytes === undefined) await fsp.rm(stateFile, { force: true })
       else await writeFileRel(home, 'plugin-sync/state.json', stateBytes)
       remoteContent = contentB1
-      const domain = mockDomain(wsFor('sess-aaa', 'Local', 2000))
-      const makeEngine = () => createEngine({ getWorkspaceDomain: () => domain, rowConfig: {
+      const makeEngine = () => createEngine({ rowConfig: {
         dshHome: home, deviceName: 'state-test', listenPort: 0, token: TOKEN, settleSec: 0,
         peers: [{ name: 'remote', url: `http://127.0.0.1:${port}`, token: TOKEN }],
       } })
@@ -296,10 +283,7 @@ async function main() {
   const homeA = await fsp.mkdtemp(path.join(tmpRoot, 'dsh-sync-a-'))
   const homeB = await fsp.mkdtemp(path.join(tmpRoot, 'dsh-sync-b-'))
 
-  const domainA = mockDomain(wsFor('sess-aaa', 'ProjX', 2000))
-  const domainB = mockDomain(wsFor('sess-bbb', 'ProjY', 2500))
   const engineA = createEngine({
-    getWorkspaceDomain: () => domainA,
     rowConfig: {
       deviceName: 'A',
       role: 'peer',
@@ -312,7 +296,6 @@ async function main() {
     },
   })
   const engineB = createEngine({
-    getWorkspaceDomain: () => domainB,
     rowConfig: {
       deviceName: 'B',
       role: 'peer',
@@ -334,8 +317,9 @@ async function main() {
     const statusA = await engineA.status()
     assert.strictEqual(statusA.token, 'test-t' + '******', 'token 打码')
     assert.strictEqual(statusA.device, 'A')
-    assert.strictEqual(statusA.workspaceWriteMode, 'domain')
+    assert.strictEqual(statusA.workspaceWriteMode, 'proposal')
     assert.strictEqual(statusA.proposalPending, false)
+    assert.strictEqual(statusA.proposalPathSafe, true)
 
     // ---------- 1. 初始同步：A 的会话/附件/workspaces 送到 B，workspace sessionIds 并集 ----------
     await writeFileRel(homeA, SESS_A, contentA1)
@@ -358,23 +342,24 @@ async function main() {
     const gotAttB = await fsp.readFile(path.join(homeB, ATT_A))
     assert.strictEqual(sha1(gotAttB), sha1(Buffer.from('attachment-bytes-A')), 'B 收到附件')
 
-    const wsB = domainB.document()
+    const wsB = await readProposal(homeB)
     assert.deepStrictEqual(
       [...wsB.tables.workspaces.ws1.sessionIds].sort(),
       ['sess-aaa', 'sess-bbb'],
-      'B 的 workspace sessionIds 为并集',
+      'B 的建议文件 workspace sessionIds 为并集',
     )
+    assert.strictEqual((await engineB.status()).proposalPending, true, 'B 建议待应用')
 
     // B 的会话也推给 A（B 第一轮推、A 第二轮拉）
     const rA2 = await engineA.runCycle()
     assert.deepStrictEqual(rA2.errors, [], 'A 第二轮无错误')
     const gotSessA = await fsp.readFile(path.join(homeA, SESS_B))
     assert.strictEqual(sha1(gotSessA), sha1(contentB1), 'A 收到 B 的会话')
-    const wsA = domainA.document()
+    const wsA = await readProposal(homeA)
     assert.deepStrictEqual(
       [...wsA.tables.workspaces.ws1.sessionIds].sort(),
       ['sess-aaa', 'sess-bbb'],
-      'A 的 workspace sessionIds 为并集',
+      'A 的建议文件 workspace sessionIds 为并集',
     )
 
     // ---------- 2. 冲突：两端都改同一会话 ----------
@@ -426,12 +411,12 @@ async function main() {
     assert.deepStrictEqual(
       JSON.parse(await fsp.readFile(path.join(homeA, 'storages/workspace.json'), 'utf8')),
       wsFor('sess-aaa', 'ProjX', 2000),
-      'domain模式从未改宿主文件哨兵A',
+      'proposal模式从未改宿主文件哨兵A',
     )
     assert.deepStrictEqual(
       JSON.parse(await fsp.readFile(path.join(homeB, 'storages/workspace.json'), 'utf8')),
       wsFor('sess-bbb', 'ProjY', 2500),
-      'domain模式从未改宿主文件哨兵B',
+      'proposal模式从未改宿主文件哨兵B',
     )
     await testStateRecovery()
     await testResourceLimitsAndErrors()

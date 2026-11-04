@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { mergeWorkspace, mergeWorkspaces, validateWorkspaceDoc, snapshotWorkspaceDomain, serializeWorkspaceDoc, readWorkspaceStatus, MAX_WORKSPACE_BYTES, MAX_WORKSPACE_IDS } from '../lib/workspace.js'
+import { mergeWorkspace, mergeWorkspaces, validateWorkspaceDoc, serializeWorkspaceDoc, readWorkspaceStatus, MAX_WORKSPACE_BYTES, MAX_WORKSPACE_IDS } from '../lib/workspace.js'
 
 const tmpRoot = fileURLToPath(new URL('./.tmp/', import.meta.url))
 await fsp.mkdir(tmpRoot, { recursive: true })
@@ -13,6 +13,7 @@ const keyPaths = (value, prefix = '') => !value || typeof value !== 'object' || 
   const next = `${prefix}/${key.replace(/~/g, '~0').replace(/\//g, '~1')}`
   return [next, ...keyPaths(item, next)]
 })
+// domain 句柄只用于证明「即使提供了也不得写」：任何 put/set 调用都会让测试失败。
 function mockDomain(initial, { failPut, failGlobal } = {}) {
   const stored = clone(initial)
   const calls = []
@@ -29,7 +30,7 @@ function mockDomain(initial, { failPut, failGlobal } = {}) {
   return { stored, calls, domain: { name: 'workspace', table(name) { assert.equal(name, 'workspaces'); return table }, global: { get: () => stored.global, async set(value) { calls.push(['set']); if (failGlobal) throw new Error('injected global failure'); stored.global = clone(value) } } } }
 }
 async function fixture(run) {
-  const home = await fsp.mkdtemp(path.join(tmpRoot, 'workspace-v3-'))
+  const home = await fsp.mkdtemp(path.join(tmpRoot, 'workspace-v4-'))
   const dataDir = path.join(home, 'plugin-sync')
   const stagingRoot = path.join(dataDir, 'staging')
   const hostPath = path.join(home, 'storages', 'workspace.json')
@@ -43,7 +44,7 @@ async function fixture(run) {
 const tests = []
 const test = (name, run) => tests.push([name, run])
 
-test('domain 无损合并 / 只写变化条目 / put 后 global.set / 幂等', () => fixture(async ({ write, stagingPath, hostPath, merge }) => {
+test('提供 domain 句柄也不得写宿主：零 put/set，结果只进建议/staging', () => fixture(async ({ write, stagingPath, hostPath, proposalPath, merge }) => {
   const local = doc()
   local.global.extra = { keep: true }
   local.tables.workspaces.ws.extra = { keep: 1, shared: { local: true }, same: 'local' }
@@ -54,61 +55,70 @@ test('domain 无损合并 / 只写变化条目 / put 后 global.set / 幂等', (
   remote.global.workspaceIds.push('new')
   const before = clone(local)
   const mock = mockDomain(local)
+  await write(hostPath, JSON.stringify(local, null, 2))
   await write(stagingPath, remote)
-  await write(hostPath, 'HOST SENTINEL: domain 模式不得读取此坏 JSON')
+  const hostBytes = await fsp.readFile(hostPath)
   const result = await merge(mock.domain)
   assert.equal(result.merged, true)
-  assert.equal(result.workspaceWriteMode, 'domain')
-  assert.equal(result.proposalPending, false)
+  assert.equal(result.workspaceWriteMode, 'proposal')
+  assert.equal(result.proposalPending, true)
+  assert.equal(result.proposalPathSafe, true)
+  assert.ok(result.warnings.some((message) => message.includes('domain')), '提供 domain 时必须给出忽略警告')
   assert.deepEqual(result.errors, [])
-  assert.deepEqual(mock.calls, [['put', 'ws'], ['put', 'new'], ['set']])
-  assert.equal(mock.stored.global.initialized, true)
-  assert.deepEqual(mock.stored.tables.workspaces.ws.extra, { keep: 1, shared: { local: true, remote: true }, same: 'local', more: 2 })
-  assert.deepEqual(mock.stored.tables.workspaces.ws.sessionIds, ['local-session', 'remote-session'])
-  assert.equal(mock.stored.tables.workspaces.ws.title, 'remote')
+  assert.deepEqual(mock.calls, [], '即使提供 domain 也不得调用 put/set')
+  assert.deepEqual(mock.stored, before, '宿主 domain 数据不变')
+  assert.deepEqual(await fsp.readFile(hostPath), hostBytes, '宿主文件字节不变')
+  const proposal = JSON.parse(await fsp.readFile(proposalPath, 'utf8'))
+  assert.equal(proposal.global.initialized, true)
+  assert.deepEqual(proposal.tables.workspaces.ws.extra, { keep: 1, shared: { local: true, remote: true }, same: 'local', more: 2 })
+  assert.deepEqual(proposal.tables.workspaces.ws.sessionIds, ['local-session', 'remote-session'])
+  assert.equal(proposal.tables.workspaces.ws.title, 'remote')
   const keys = new Set(keyPaths(result.workspace))
   assert.ok(keyPaths(before).every((key) => keys.has(key)))
   assert.deepEqual(validateWorkspaceDoc(result.workspace, { requireEnvelope: true }), [])
   assert.deepEqual(JSON.parse(await fsp.readFile(stagingPath, 'utf8')), result.workspace)
-  assert.equal(await fsp.readFile(hostPath, 'utf8'), 'HOST SENTINEL: domain 模式不得读取此坏 JSON')
   mock.calls.length = 0
-  await merge(mock.domain)
-  assert.deepEqual(mock.calls, [])
+  const again = await merge(mock.domain)
+  assert.deepEqual(mock.calls, [], '幂等轮同样零调用')
+  assert.equal(again.merged, true)
+  assert.deepEqual(again.workspace, result.workspace)
 }))
 
-test('B3 坏远端条目不得进入索引/default，合法远端独有条目保留', () => fixture(async ({ write, stagingPath, merge }) => {
+test('B3 坏远端条目不得进入索引/default，合法远端独有条目保留', () => fixture(async ({ write, stagingPath, hostPath, proposalPath, merge }) => {
   const remote = doc()
   remote.tables.workspaces.bad = null
   remote.tables.workspaces.incomplete = { path: '/bad' }
   remote.tables.workspaces.good = entry('good')
   remote.global.workspaceIds = ['bad', 'incomplete', 'good']
   remote.global.defaultWorkspaceId = 'bad'
-  const mock = mockDomain(doc())
+  await write(hostPath, doc())
   await write(stagingPath, remote)
-  const result = await merge(mock.domain)
+  const result = await merge()
   assert.equal(result.merged, true)
   assert.ok(result.errors.some((message) => message.includes('bad')))
-  assert.deepEqual(mock.stored.global.workspaceIds, ['ws', 'good'])
-  assert.equal(mock.stored.global.defaultWorkspaceId, 'ws')
-  assert.equal(Object.hasOwn(mock.stored.tables.workspaces, 'bad'), false)
-  assert.equal(Object.hasOwn(mock.stored.tables.workspaces, 'incomplete'), false)
+  const proposal = JSON.parse(await fsp.readFile(proposalPath, 'utf8'))
+  assert.deepEqual(proposal.global.workspaceIds, ['ws', 'good'])
+  assert.equal(proposal.global.defaultWorkspaceId, 'ws')
+  assert.equal(Object.hasOwn(proposal.tables.workspaces, 'bad'), false)
+  assert.equal(Object.hasOwn(proposal.tables.workspaces, 'incomplete'), false)
   assert.deepEqual(validateWorkspaceDoc(result.workspace, { requireEnvelope: true }), [])
 }))
 
-test('B4 特殊 id/未知子树保留且原型不污染', () => fixture(async ({ write, stagingPath, merge }) => {
-  const local = doc(), remote = doc()
+test('B4 特殊 id/未知子树保留且原型不污染', () => fixture(async ({ write, stagingPath, hostPath, merge }) => {
+  const local = doc()
   local.tables.workspaces = JSON.parse('{"__proto__":null,"constructor":null}')
   local.tables.workspaces.__proto__ = entry('proto')
   local.tables.workspaces.constructor = entry('constructor')
   local.global.workspaceIds = ['__proto__', 'constructor']; local.global.defaultWorkspaceId = '__proto__'
   local.tables.workspaces.__proto__.extra = JSON.parse('{"__proto__":{"keep":1},"constructor":{"local":true}}')
+  const remote = doc()
   remote.tables.workspaces = JSON.parse('{"__proto__":null,"toString":null}')
   remote.tables.workspaces.__proto__ = { ...entry('remote'), extra: JSON.parse('{"__proto__":{"more":2},"constructor":{"remote":true}}') }
   remote.tables.workspaces.toString = entry('toString')
   remote.global.workspaceIds = ['__proto__', 'toString']; remote.global.defaultWorkspaceId = '__proto__'
-  const mock = mockDomain(local)
+  await write(hostPath, JSON.stringify(local))
   await write(stagingPath, remote)
-  const result = await merge(mock.domain)
+  const result = await merge()
   assert.equal(result.merged, true)
   assert.deepEqual(Object.keys(result.workspace.tables.workspaces), ['__proto__', 'constructor', 'toString'])
   assert.deepEqual(result.workspace.tables.workspaces.__proto__.extra.__proto__, { keep: 1, more: 2 })
@@ -117,7 +127,7 @@ test('B4 特殊 id/未知子树保留且原型不污染', () => fixture(async ({
   assert.equal(Object.prototype.more, undefined)
 }))
 
-test('坏本地domain/坏信封/坏合并结果均零写入', () => fixture(async ({ write, stagingPath, merge }) => {
+test('坏本地文件/坏信封/坏合并结果均零写入', () => fixture(async ({ write, stagingPath, hostPath, proposalPath, merge }) => {
   const broken = [doc(), doc(), doc(), doc(), doc()]
   delete broken[0].global.initialized
   broken[1].tables.workspaces.ws = null
@@ -125,63 +135,27 @@ test('坏本地domain/坏信封/坏合并结果均零写入', () => fixture(asyn
   broken[3].global.defaultWorkspaceId = 'dangling'
   broken[4].tables.workspaces.ws.createdAt = 1
   for (const value of broken) {
-    const mock = mockDomain(value)
+    await write(hostPath, JSON.stringify(value))
     await write(stagingPath, doc())
-    const result = await merge(mock.domain)
+    const result = await merge()
     assert.equal(result.merged, false)
     assert.ok(result.error)
-    assert.deepEqual(mock.calls, [])
+    await assert.rejects(fsp.access(proposalPath), { code: 'ENOENT' })
   }
   for (const remote of [{}, { ...doc(), unit: { name: 'other', version: 2 } }, { ...doc(), unit: { name: 'workspace', version: 3 } }, null]) {
-    const mock = mockDomain(doc())
+    await write(hostPath, JSON.stringify(doc()))
     await write(stagingPath, remote === null ? 'null' : remote)
-    const result = await merge(mock.domain)
+    const result = await merge()
     assert.equal(result.merged, false)
-    assert.deepEqual(mock.calls, [])
+    await assert.rejects(fsp.access(proposalPath), { code: 'ENOENT' })
   }
-  const mock = mockDomain(doc())
   const remote = doc(); remote.global.workspaceIds = { nested: true }
   await write(stagingPath, remote)
-  const result = await merge(mock.domain)
+  const result = await merge()
   assert.equal(result.merged, true, '坏远端已知数组被现有本地合法值隔离')
-  assert.deepEqual(mock.calls, [])
 }))
 
-test('put 中途失败保留已成功写入，停止后续put/global/staging，无回滚', () => fixture(async ({ write, stagingPath, hostPath, merge }) => {
-  const remote = doc()
-  remote.tables.workspaces.ws.title = 'changed'; remote.tables.workspaces.ws.updatedAt = '2027'
-  remote.tables.workspaces.fail = entry('fail'); remote.tables.workspaces.later = entry('later')
-  remote.global.workspaceIds.push('fail', 'later')
-  await write(stagingPath, remote)
-  const stagedBefore = await fsp.readFile(stagingPath)
-  await write(hostPath, 'untouched host')
-  const mock = mockDomain(doc(), { failPut: 'fail' })
-  const result = await merge(mock.domain)
-  assert.equal(result.domainWriteFailed, true)
-  assert.equal(result.merged, false)
-  assert.match(result.error, /injected put failure/)
-  assert.deepEqual(mock.calls, [['put', 'ws'], ['put', 'fail']])
-  assert.equal(mock.stored.tables.workspaces.ws.title, 'changed')
-  assert.equal(Object.hasOwn(mock.stored.tables.workspaces, 'later'), false)
-  assert.deepEqual(mock.stored.global.workspaceIds, ['ws'])
-  assert.deepEqual(await fsp.readFile(stagingPath), stagedBefore)
-  assert.equal(await fsp.readFile(hostPath, 'utf8'), 'untouched host')
-  assert.deepEqual(await fsp.readdir(path.dirname(hostPath)), ['workspace.json'])
-}))
-
-test('global.set 失败不回滚已完成put且返回错误', () => fixture(async ({ write, stagingPath, merge }) => {
-  const remote = doc(); remote.tables.workspaces.new = entry(); remote.global.workspaceIds.push('new')
-  await write(stagingPath, remote)
-  const mock = mockDomain(doc(), { failGlobal: true })
-  const result = await merge(mock.domain)
-  assert.equal(result.domainWriteFailed, true)
-  assert.match(result.error, /injected global failure/)
-  assert.deepEqual(mock.calls, [['put', 'new'], ['set']])
-  assert.ok(Object.hasOwn(mock.stored.tables.workspaces, 'new'))
-  assert.deepEqual(mock.stored.global.workspaceIds, ['ws'])
-}))
-
-test('proposal 降级原子写建议/staging，宿主从未打开写且原始字节不变', () => fixture(async ({ write, stagingPath, hostPath, proposalPath, merge }) => {
+test('proposal 原子写建议/staging，宿主从未打开写且原始字节不变', () => fixture(async ({ write, stagingPath, hostPath, proposalPath, merge }) => {
   const local = doc(), remote = doc()
   local.customTop = { keep: true }; local.tables.workspaces.ws.extra = { local: true }
   remote.tables.workspaces.ws.sessionIds.push('remote-session')
@@ -195,13 +169,14 @@ test('proposal 降级原子写建议/staging，宿主从未打开写且原始字
   fsp.rename = async (src, dest, ...args) => { assert.notEqual(path.resolve(String(dest)), hostPath); return originalRename(src, dest, ...args) }
   fsp.copyFile = async (src, dest, ...args) => { assert.notEqual(path.resolve(String(dest)), hostPath); return originalCopy(src, dest, ...args) }
   let result
-  try { result = await merge(undefined) }
+  try { result = await merge() }
   finally { fsp.open = originalOpen; fsp.writeFile = originalWrite; fsp.rename = originalRename; fsp.copyFile = originalCopy }
   assert.ok(hostOpens >= 1)
   assert.equal(result.merged, true)
   assert.equal(result.workspaceWriteMode, 'proposal')
   assert.equal(result.proposalPending, true)
   assert.equal(result.proposalPath, proposalPath)
+  assert.equal(result.proposalPathSafe, true)
   assert.ok(result.warnings.some((message) => message.includes('存在待应用的工作区合并建议')))
   assert.deepEqual(result.errors, [])
   assert.deepEqual(await fsp.readFile(hostPath), original)
@@ -210,38 +185,42 @@ test('proposal 降级原子写建议/staging，宿主从未打开写且原始字
   assert.deepEqual(await fsp.readdir(path.dirname(hostPath)), ['workspace.json'])
 }))
 
-test('proposal 本地缺失仅完整合法远端可生成；domain恢复后清除旧建议', () => fixture(async ({ write, stagingPath, hostPath, proposalPath, merge }) => {
+test('本地缺失仅完整合法远端可生成建议；坏远端不能破坏既有建议', () => fixture(async ({ write, stagingPath, hostPath, proposalPath, merge }) => {
   await write(stagingPath, doc())
-  assert.equal((await merge(undefined)).proposalPending, true)
-  await assert.rejects(fsp.access(hostPath), { code: 'ENOENT' })
-  const mock = mockDomain(doc())
-  assert.equal((await merge(mock.domain)).workspaceWriteMode, 'domain')
-  await assert.rejects(fsp.access(proposalPath), { code: 'ENOENT' })
+  const first = await merge()
+  assert.equal(first.proposalPending, true)
+  assert.equal(first.proposalPathSafe, true)
+  await assert.rejects(fsp.access(hostPath), { code: 'ENOENT' }, '本地缺失时绝不创建宿主文件')
+  const pendingDoc = JSON.parse(await fsp.readFile(proposalPath, 'utf8'))
+  // 完全没有合法输入（无本地、无建议、坏远端）时必须中止且不产生任何文件。
+  await fsp.rm(proposalPath)
   const broken = doc(); delete broken.global.initialized
   await write(stagingPath, broken)
-  const result = await merge(undefined)
+  const result = await merge()
   assert.equal(result.merged, false)
   await assert.rejects(fsp.access(proposalPath), { code: 'ENOENT' })
+  // 既有建议在场时，坏远端不能破坏它（建议每轮参与合并）。
+  await write(proposalPath, JSON.stringify(pendingDoc))
+  const kept = await merge()
+  assert.equal(kept.merged, true)
+  assert.deepEqual(JSON.parse(await fsp.readFile(proposalPath, 'utf8')), pendingDoc)
 }))
 
-test('跨周期proposal积累与恢复domain：旧建议独有会话不得丢失', () => fixture(async ({ write, stagingPath, hostPath, proposalPath, merge }) => {
+test('跨周期proposal积累：旧建议独有会话不得丢失，坏建议拒合并', () => fixture(async ({ write, stagingPath, hostPath, proposalPath, merge }) => {
   await write(hostPath, doc())
   const firstRemote = doc(); firstRemote.tables.workspaces.ws.sessionIds = ['first-remote']
   await write(stagingPath, firstRemote)
-  assert.equal((await merge(undefined)).proposalPending, true)
+  assert.equal((await merge()).proposalPending, true)
   const nextRemote = doc(); nextRemote.tables.workspaces.ws.sessionIds = ['next-remote']
   await write(stagingPath, nextRemote)
-  const second = await merge(undefined)
+  const second = await merge()
   assert.deepEqual(second.workspace.tables.workspaces.ws.sessionIds, ['local-session', 'first-remote', 'next-remote'])
-  // 即使 staging 丢掉旧建议，恢复domain也必须先消费proposal。
+  // staging 回退为旧版本时，建议每轮参与合并，独有会话不得丢失。
   await write(stagingPath, doc())
-  const mock = mockDomain(doc())
-  const restored = await merge(mock.domain)
-  assert.equal(restored.proposalPending, false)
-  assert.deepEqual(mock.stored.tables.workspaces.ws.sessionIds, ['local-session', 'first-remote', 'next-remote'])
-  await assert.rejects(fsp.access(proposalPath), { code: 'ENOENT' })
+  const third = await merge()
+  assert.deepEqual(third.workspace.tables.workspaces.ws.sessionIds, ['local-session', 'first-remote', 'next-remote'])
   await write(proposalPath, '{bad proposal')
-  const broken = await merge(mock.domain)
+  const broken = await merge()
   assert.equal(broken.merged, false)
   assert.equal(broken.proposalPending, true)
   assert.match(broken.error, /既有工作区建议/)
@@ -254,85 +233,78 @@ test('有界三态读取：missing / JSON损坏 / I/O失败 / 容量失败均不
   assert.equal((await readWorkspaceStatus(hostPath)).state, 'parse-error')
   await write(stagingPath, doc())
   const before = await fsp.readFile(hostPath)
-  assert.match((await merge(undefined)).error, /JSON 解析失败/)
+  assert.match((await merge()).error, /JSON 解析失败/)
   assert.deepEqual(await fsp.readFile(hostPath), before)
   await fsp.rm(hostPath)
   await fsp.mkdir(hostPath)
   assert.equal((await readWorkspaceStatus(hostPath)).state, 'read-error')
-  assert.equal((await merge(undefined)).merged, false)
+  assert.equal((await merge()).merged, false)
   await fsp.rm(hostPath, { recursive: true })
   await write(hostPath, '')
   await fsp.truncate(hostPath, MAX_WORKSPACE_BYTES + 1)
-  assert.match((await merge(undefined)).error, /上限/)
+  assert.match((await merge()).error, /上限/)
   assert.equal((await fsp.stat(hostPath)).size, MAX_WORKSPACE_BYTES + 1)
   await assert.rejects(fsp.access(proposalPath), { code: 'ENOENT' })
   await write(hostPath, doc()); await write(stagingPath, '{bad')
-  assert.match((await merge(undefined)).error, /staging.*JSON 解析失败/)
+  assert.match((await merge()).error, /staging.*JSON 解析失败/)
   await fsp.truncate(stagingPath, MAX_WORKSPACE_BYTES + 1)
-  assert.match((await merge(mockDomain(doc()).domain)).error, /上限/)
+  assert.match((await merge()).error, /上限/)
   await fsp.rm(stagingPath)
   const unreadable = path.join(home, 'unreadable'); await fsp.mkdir(unreadable)
   assert.equal((await readWorkspaceStatus(unreadable)).state, 'read-error')
 }))
 
-test('B9 domain 输入32MiB/数组100000/表100000上限，超限零put/set', () => fixture(async ({ write, stagingPath, merge }) => {
+test('B9 本地文件输入超限（32MiB字节/数组100000）时拒写', () => fixture(async ({ write, stagingPath, hostPath, proposalPath, merge }) => {
   await write(stagingPath, doc())
-  const oversized = doc(); oversized.global.extra = 'x'.repeat(MAX_WORKSPACE_BYTES)
+  await write(hostPath, '')
+  await fsp.truncate(hostPath, MAX_WORKSPACE_BYTES + 1)
+  let result = await merge()
+  assert.equal(result.merged, false)
+  assert.match(result.error, /上限/)
+  await assert.rejects(fsp.access(proposalPath), { code: 'ENOENT' })
   const tooMany = doc(); tooMany.tables.workspaces.ws.sessionIds = Array.from({ length: MAX_WORKSPACE_IDS + 1 }, (_, i) => `s${i}`)
-  for (const input of [oversized, tooMany]) {
-    const mock = mockDomain(input)
-    const result = await merge(mock.domain)
-    assert.equal(result.merged, false)
-    assert.match(result.error, /上限/)
-    assert.deepEqual(mock.calls, [])
-  }
-  const mock = mockDomain(doc())
-  const originalTable = mock.domain.table
-  mock.domain.table = () => ({ ...originalTable('workspaces'), size: MAX_WORKSPACE_IDS + 1 })
-  assert.match((await merge(mock.domain)).error, /100000/)
-  assert.deepEqual(mock.calls, [])
-  assert.throws(() => snapshotWorkspaceDomain({ global: { get: () => doc().global }, table: () => ({ *entries() { for (let i = 0; i <= MAX_WORKSPACE_IDS; i++) yield [`id-${i}`, entry()] } }) }), /100000/)
+  await write(hostPath, JSON.stringify(tooMany))
+  result = await merge()
+  assert.equal(result.merged, false)
+  assert.match(result.error, /上限/)
+  await assert.rejects(fsp.access(proposalPath), { code: 'ENOENT' })
 }))
 
-test('B9 合并产物超32MiB时domain/proposal均拒写且保留原建议', () => fixture(async ({ write, stagingPath, hostPath, proposalPath, merge }) => {
+test('B9 合并产物超32MiB时拒写且保留原建议', () => fixture(async ({ write, stagingPath, hostPath, proposalPath, merge }) => {
   const local = doc(), remote = doc(), text = 'x'.repeat(17 * 1024 * 1024)
   local.tables.workspaces.ws.extra = { local: text }
   remote.tables.workspaces.ws.extra = { remote: text }
   assert.ok(serializeWorkspaceDoc(local).length < MAX_WORKSPACE_BYTES)
   assert.ok(serializeWorkspaceDoc(remote).length < MAX_WORKSPACE_BYTES)
   await write(stagingPath, remote)
-  const mock = mockDomain(local)
-  assert.match((await merge(mock.domain)).error, /上限/)
-  assert.deepEqual(mock.calls, [])
   const oldProposal = doc(); oldProposal.global.keepSuggestion = true
   await write(hostPath, local); await write(proposalPath, oldProposal)
   const bytes = await fsp.readFile(hostPath)
   const suggestionBytes = await fsp.readFile(proposalPath)
-  const rejected = await merge(undefined)
+  const rejected = await merge()
   assert.match(rejected.error, /上限/)
   assert.equal(rejected.proposalPending, true)
   assert.deepEqual(await fsp.readFile(proposalPath), suggestionBytes)
   assert.deepEqual(await fsp.readFile(hostPath), bytes)
 }))
 
-test('B9 合并sessionIds/表并集超100000时domain/proposal均拒写', () => fixture(async ({ write, stagingPath, hostPath, proposalPath, merge }) => {
+test('B9 合并sessionIds/表并集超100000时拒写', () => fixture(async ({ write, stagingPath, hostPath, proposalPath, merge }) => {
   const local = doc(), remote = doc()
   local.tables.workspaces.ws.sessionIds = Array.from({ length: 50001 }, (_, i) => `l${i}`)
   remote.tables.workspaces.ws.sessionIds = Array.from({ length: 50000 }, (_, i) => `r${i}`)
   await write(stagingPath, remote)
-  const mock = mockDomain(local)
-  assert.match((await merge(mock.domain)).error, /100000/)
-  assert.deepEqual(mock.calls, [])
   await write(hostPath, local)
-  assert.match((await merge(undefined)).error, /100000/)
+  let result = await merge()
+  assert.match(result.error, /100000/)
   await assert.rejects(fsp.access(proposalPath), { code: 'ENOENT' })
   const table = (prefix, count) => Object.fromEntries(Array.from({ length: count }, (_, i) => [`${prefix}${i}`, entry()]))
   local.tables.workspaces = table('l', 50001); remote.tables.workspaces = table('r', 50000)
   local.global.workspaceIds = []; local.global.defaultWorkspaceId = ''; remote.global.workspaceIds = []; remote.global.defaultWorkspaceId = ''
+  await write(hostPath, local)
   await write(stagingPath, remote)
-  const tableMock = mockDomain(local)
-  assert.match((await merge(tableMock.domain)).error, /100000/)
-  assert.deepEqual(tableMock.calls, [])
+  result = await merge()
+  assert.match(result.error, /100000/)
+  await assert.rejects(fsp.access(proposalPath), { code: 'ENOENT' })
 }))
 
 test('序列化准确按UTF8/转义后字节限额，循环/非JSON输入拒绝', () => {
@@ -353,5 +325,61 @@ test('序列化准确按UTF8/转义后字节限额，循环/非JSON输入拒绝'
   assert.deepEqual(validateWorkspaceDoc(merged, { requireEnvelope: true }), [])
 })
 
+test('符号链接攻击：proposed 指向宿主 storages 必须拒绝写', () => fixture(async ({ dataDir, write, stagingPath, hostPath, proposalPath, merge }) => {
+  await write(hostPath, doc())
+  const sentinel = await fsp.readFile(hostPath)
+  await write(stagingPath, doc())
+  const storagesDir = path.dirname(hostPath)
+  await fsp.mkdir(dataDir, { recursive: true })
+  await fsp.symlink(storagesDir, path.dirname(proposalPath))
+  const result = await merge()
+  assert.equal(result.merged, false)
+  assert.match(result.error, /拒绝写入/)
+  assert.equal(result.proposalPathSafe, false)
+  assert.deepEqual(await fsp.readFile(hostPath), sentinel, '宿主 storages/workspace.json 字节不变')
+  assert.deepEqual(await fsp.readdir(storagesDir), ['workspace.json'], 'storages 内没有新增文件')
+}))
+
+test('符号链接攻击：staging/workspace 指向宿主 storages 必须拒绝写', () => fixture(async ({ stagingRoot, write, stagingPath, hostPath, proposalPath, merge }) => {
+  await write(hostPath, doc())
+  const sentinel = await fsp.readFile(hostPath)
+  const storagesDir = path.dirname(hostPath)
+  await fsp.mkdir(stagingRoot, { recursive: true })
+  await fsp.symlink(storagesDir, path.join(stagingRoot, 'workspace'))
+  const result = await merge()
+  assert.equal(result.merged, false)
+  assert.match(result.error, /拒绝写入/)
+  assert.deepEqual(await fsp.readFile(hostPath), sentinel, '宿主 storages/workspace.json 字节不变')
+  assert.deepEqual(await fsp.readdir(storagesDir), ['workspace.json'], 'storages 内没有新增文件')
+  // 建议文件路径本身安全：proposal 正常写出，供宿主/人工应用。
+  assert.equal(result.proposalPending, true)
+  assert.equal(result.proposalPathSafe, true)
+  assert.equal(JSON.parse(await fsp.readFile(proposalPath, 'utf8')).global.initialized, true)
+}))
+
+test('符号链接攻击：目标文件本身是符号链接必须拒绝写', () => fixture(async ({ dataDir, write, stagingPath, hostPath, proposalPath, merge }) => {
+  await write(hostPath, doc())
+  const sentinel = await fsp.readFile(hostPath)
+  await write(stagingPath, doc())
+  await fsp.mkdir(dataDir, { recursive: true })
+  await fsp.mkdir(path.dirname(proposalPath), { recursive: true })
+  await fsp.symlink(hostPath, proposalPath, 'file')
+  let result = await merge()
+  assert.equal(result.merged, false)
+  assert.match(result.error, /符号链接/)
+  assert.equal(result.proposalPathSafe, false)
+  assert.deepEqual(await fsp.readFile(hostPath), sentinel, '宿主 storages/workspace.json 字节不变')
+  // 换成 staging 目标文件同样受保护
+  await fsp.rm(proposalPath)
+  result = await merge()
+  assert.equal(result.merged, true, '清除符号链接后建议文件可正常写出')
+  await fsp.rm(stagingPath)
+  await fsp.symlink(hostPath, stagingPath, 'file')
+  result = await merge()
+  assert.equal(result.merged, false)
+  assert.match(result.error, /符号链接/)
+  assert.deepEqual(await fsp.readFile(hostPath), sentinel, '宿主 storages/workspace.json 字节不变')
+}))
+
 for (const [name, run] of tests) { await run(); console.log(`PASS ${name}`) }
-console.log(`ALL PASS (${tests.length} workspace domain/proposal cases)`)
+console.log(`ALL PASS (${tests.length} workspace proposal-only cases)`)

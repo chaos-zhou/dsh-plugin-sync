@@ -103,3 +103,53 @@ README 已同步严格信封、引用校验、备份与冻结、快照保护、�
 4. domain 写入是逐条一致，非整轮原子提交；中途失败下一轮从 domain 实际状态继续（README 已声明）。
 5. 测试基于 FIX-SPEC-v3 的 domain 契约 mock；真实宿主 `DomainImpl` 的校验/排队语义如有出入，需真机联调验证。
 6. 规格验收第 5 条「交 Codex 第三轮审核，无 BLOCKER 才允许启用」尚未执行，启用前待 PM 安排。
+
+---
+
+# Claude Code 本轮（v4 安全重构）
+
+日期：2026-11-04。环境：Node.js v24.15.0，macOS（本机端口监听可用）。
+
+依据 FIX-SPEC-v4 落实 Codex 第三轮审核的两个 BLOCKER。第三轮审核后仍未封闭的项：
+
+1. **domain 读改写并发覆盖**：快照 → `table.put` → `global.set` 之间宿主可并发更新工作区/置顶，`global.set` 会整体覆盖宿主新数据；宿主 `DomainImpl` 无事务/CAS/版本号 API，插件侧无法安全修复。
+2. **proposal/staging 目录符号链接**：`proposed`（或 staging 父级）若是指向 `dshHome/storages` 的符号链接，`atomicWrite` 会借 rename 覆盖宿主 `workspace.json`；domain 成功后的 `rm(proposalPath)` 会删除宿主文件。
+
+v4 决策：**v1.1 起插件完全不写宿主工作区索引**，`workspaceWriteMode` 恒为 `'proposal'`，并对两个写入目标做真实路径边界校验。
+
+## 逐项修复（位置 → 测试 → 结果）
+
+测试列：工作区 = `tests/workspace.compat.test.mjs`（15 组），离线 = `tests/engine.offline.test.mjs`（7 组），HTTP = `tests/engine.test.mjs`，fixture = `tests/fixture.accept.test.mjs`。
+
+| 项目 | 位置与行为 | 测试 | 结果 |
+|---|---|---|---|
+| V1 移除 domain 写路径 | `index.js` 删除 `ctx.inject(['storageDomain'])` 注入与 `getWorkspaceDomain` 句柄传递；`lib/engine.js` 删除 `getWorkspaceDomain/workspaceWriteMode` 动态判定与 `domainWriteFailed` 停写逻辑，`workspaceWriteMode` 输出恒 `'proposal'`，`proposalPending/proposalPath` 保留并新增 `proposalPathSafe`；`lib/workspace.js` 整体删除 `snapshotWorkspaceDomain`、domain 写入分支（`table.put`/`global.set`/成功后 `rm` 建议文件）与 `domainWriteFailed` 返回值；`mergeWorkspace` 保留 `domain` 形参但忽略并记 warning；本地输入一律来自宿主文件的有界三态只读（`lib/workspace.js readWorkspaceStatus`），`lib/export.js` 删除 `workspaceDomain` 参数分支、保留只读参考。 | 工作区「提供 domain 句柄也不得写宿主：零 put/set」、离线「V1 提供domain句柄也不写宿主（零put/set/宿主字节不变/建议并集）」与「index.apply不再注入storageDomain」、离线全程 `ignoredDomainLookups === 0`、fixture「proposal-only + 提供domain零写入」、HTTP 哨兵A/B（宿主 `storages/workspace.json` 五轮同步后字节不变，建议文件 sessionIds 为并集）。 | PASS |
+| V2 真实路径边界 | `lib/workspace.js guardedWrite`：`mkdir(recursive)` 后 `realpath(写入目录)` 必须位于 `realpath(dataDir)`/`realpath(stagingRoot)` 内（`path.relative` 不以 `..` 开头且非绝对）；目标文件 `lstat` 为符号链接即拒绝；写入目录或目标 `realpath` 落在 `realpath(<dshHome>/storages)` 内一律拒绝（storages 不存在时跳过该检查）；校验失败抛错 → 计入 `cycle.errors`、置 `proposalPathSafe: false`、不产生任何文件。`atomicWrite` 临时文件 `wx` 独占创建继续兜底 TOCTOU。 | 工作区三组真实符号链接攻击（`proposed` → storages、`staging/workspace` → storages、目标文件本身是符号链接，均用 `tests/.tmp` 实际 `fsp.symlink` 构造）：全部拒绝写、报 error、`storages/workspace.json` 字节不变且目录内无新增文件；离线/HTTP 全程宿主字节不变。 | PASS |
+| V3 测试补齐 | 工作区测试重写为 proposal-only 15 组：删 domain 写预期（put 顺序/中途失败/global.set 失败/snapshot 上限直测），新增「提供 domain 零 put/set、宿主数据不变」与三类真实 symlink 攻击；B3/B4/B9（输入 32MiB、sessionIds/表并集 100000、产物 32MiB）改为宿主文件/建议文件输入；跨周期建议积累改为「staging 回退旧版本也不丢建议」。离线/HTTP/fixture 对应调整（见 V1 行），B7/B8/B9 既有断言保持通过。 | 五个测试文件全部 exit 0。 | PASS |
+| V4 文档 | README「工作区索引写入模式」整节重写（v1.1 只有 proposal、移除 domain 的原因、guardedWrite 三条规则、`proposalPathSafe` 字段、v1.0 → v1.1 升级注意）；同步内容表、工具表、测试注释同步更新。本报告新增本章节。 | 文档核对。 | 完成 |
+| V5 版本 | `package.json` `1.1.0`；README 顶部标注 v1.1 行为变化（相对 v1.0 不再自动应用工作区索引）。 | 文档核对。 | 完成 |
+
+## 验收命令与结果
+
+`node --check`：`index.js` + `lib/` 全部 10 个 js + `tests/` 全部 5 个 mjs = 16 个文件，全部 exit 0。
+
+| 命令 | 结果 |
+|---|---|
+| `node tests/workspace.compat.test.mjs` | exit 0，15 组 ALL PASS（含 3 组真实符号链接攻击） |
+| `node tests/apply.compat.test.mjs` | exit 0，37 项 ALL PASS（本轮未改动，B7/B8/B9 保持通过） |
+| `node tests/engine.offline.test.mjs` | exit 0，7 组 ALL PASS |
+| `node tests/fixture.accept.test.mjs` | exit 0，ALL PASS（proposal-only；宿主字节不变、`initialized` 保留、本地递归键不缩减、sessionIds 并集；提供 domain 零写入） |
+| `node tests/engine.test.mjs` | exit 0，ALL PASS（真实 HTTP 双节点全流程） |
+
+写入自检（grep，`lib/` 与 `index.js`）：
+
+- `grep "storages/workspace.json"` 仅 2 处，均为只读 `readWorkspaceStatus` 调用（`lib/workspace.js:473`、`lib/export.js:97`），生产代码全部写调用（atomicWrite/rename/copyFile/appendFile/open/rm）目标均在本插件 `dataDir`/`staging`/store/日志或 apply 既有落回规则内，无任何调用以宿主 `storages/` 为目标；
+- `grep -nE "snapshotWorkspaceDomain|storageDomain|domainWriteFailed|global\.set|table\.put|\.put\("` 仅命中 `index.js:9` 的一行说明注释（非代码）；domain 相关代码已全部删除。测试内保留的 mock domain 只用于证明「即使提供也不得写」，其 put/set 均有零调用断言。
+
+## 遗留风险
+
+1. 工作区索引依赖宿主提供事务 API 或人工应用 `<dataDir>/proposed/workspace.json`；建议每轮参与合并不会丢失，但长期不接入时工作区索引不落盘到宿主。
+2. `guardedWrite` 的 realpath/lstat 校验与最终 rename 之间存在理论 TOCTOU 窗口；`atomicWrite` 的 `wx` 独占临时文件与 rename 目标非链接语义可缓解，但不承诺零窗口。
+3. `tests/engine.test.mjs` 依赖环境放行本机端口监听；换环境重跑前不能视为永久通过。
+4. 无原生 zstd 解压能力的 Node（如 20.x）会话自动落回保守拒绝（推送/拉取到 staging 不受影响）；需 Node ≥ 22.15/23.8+。
+5. 规格验收第 6 条「更新后的 FIX-REPORT 与代码一致」已满足，但「交 Codex 第四轮审核」尚未执行，送审前待 PM 安排。

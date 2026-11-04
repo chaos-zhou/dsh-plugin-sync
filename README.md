@@ -2,6 +2,8 @@
 
 DSH 多端同步插件：在两台（或多台）安装了 DSH 的设备之间同步**会话、附件、摘要缓存、工作区索引**，可选同步插件配置。局域网内点对点直连，或经一台 hub 服务器中转。**零依赖**，只使用 Node 内置模块（Node >= 20），复制目录即可安装。
 
+> **v1.1 行为变化**：工作区索引不再写宿主 `storages/workspace.json`，也不再使用宿主 `storageDomain` 服务——合并结果只生成建议文件，等待宿主事务 API 或人工应用。会话/附件/摘要缓存自动同步不受影响，详见「工作区索引写入模式」。
+
 ## 安装
 
 ### 本机（第一台设备）
@@ -101,7 +103,7 @@ hub 只做字节中转（`/v1/ping`、`/v1/index`、`/v1/blob`），不解析 DS
 | 附件 | `attachments/**` | 同名路径 |
 | 摘要缓存 | `storages/session_projcache/sessions/*.json` | `projcache/sessions/*.json` |
 | 插件配置 | `profiles/*/cordis.patch.yml` | `config/<profile>/cordis.patch.yml`（保留导出，暂停自动写回） |
-| 工作区索引 | 宿主 `workspace` domain；降级时只读参考 `storages/workspace.json` | `workspace/workspace.json`（无损合并，经 domain 应用或生成建议） |
+| 工作区索引 | 只读参考宿主 `storages/workspace.json` | `workspace/workspace.json`（无损合并，只生成建议，不写宿主） |
 
 **从不传输**：`plugin-sync/`（自身数据）、`node_modules/`、`electron/`、`speech-to-text/`、`cache/`、`llm-deepseek/`、`.credentials.yaml`、`.anonymous-user-id`、所有 `*.lock` 文件。所有落盘都先写 `*.tmp-<pid>` 再原子 rename，对端不会读到半个文件。
 
@@ -124,29 +126,38 @@ hub 只做字节中转（`/v1/ping`、`/v1/index`、`/v1/blob`），不解析 DS
 
 ## 工作区索引写入模式
 
-第三轮修复（v1.1 方案）取消插件对宿主 `storages/workspace.json` 的直接写入。文件备份、恢复、rename 和写入冻结逻辑全部移除：插件侧文件事务无法与宿主的并发写入共用队列，回滚还可能覆盖宿主的新数据。
+v1.1 起**只有 proposal 模式**：插件绝不写宿主 `storages/workspace.json`，也不再请求注入宿主 `storageDomain` 服务。合并结果只写入 `<dataDir>/proposed/workspace.json`（`dataDir` 为 `<dshHome>/plugin-sync`），另写一份 `staging/workspace/workspace.json` 副本随同步推给对端；应用到宿主需等宿主提供事务 API 或人工处理。
 
-| 模式 | 读取与写入 | 状态 |
-|---|---|---|
-| `domain`（服务可用时默认） | 可选注入 `storageDomain`，通过 `ctx.storageDomain.get('workspace')` 取得已打开句柄，读取 `global.get()` 和 `table('workspaces').entries()`；只对变化/新增条目调用 `put`，最后在 global 有变化时调用 `global.set`。宿主负责排队、校验与持久化。 | `workspaceWriteMode: 'domain'` |
-| `proposal`（服务或 domain 缺失） | 有界只读宿主文件作为参考，把合并结果原子写入 `<dataDir>/proposed/workspace.json`；绝不写宿主文件。会话、附件、摘要缓存仍按各自规则自动同步；工作区索引需等宿主 API 可用，或手动处理建议。 | `workspaceWriteMode: 'proposal'`、`proposalPending: true`、`proposalPath`，本轮 `warnings` 提示待应用建议 |
+为什么取消 domain 写路径：宿主 domain 只有 get/set/put/delete/update，没有事务/CAS/版本号 API。v1.1 之前的方案是「快照 → 逐条 put → global.set」的读改写——put 等待期间宿主一旦更新工作区/置顶，最后的 global.set 会用旧快照的合并结果整体覆盖宿主新数据，插件侧无法安全修复，因此整条路径移除（即使外部代码传入 domain 句柄，插件也只记 warning 并忽略）。
 
-`dataDir` 为 `<dshHome>/plugin-sync`。`dsh_sync_status` 及同步摘要都展示写入模式和建议状态；建议持续保留，待 domain 成功应用后清除。任一 `put/set` 抛错，错误进入 `cycle.errors`，本轮停止后续 domain 写，已成功的单条写入保留，不回滚。
+| 项目 | 行为 |
+|---|---|
+| 读取 | 宿主 `storages/workspace.json` 只读（32MiB 有界三态读取）；缺失/解析失败/读取失败时中止合并，绝不写任何文件 |
+| 写入 | `<dataDir>/proposed/workspace.json` 与 `<dataDir>/staging/workspace/workspace.json`，先写 `*.tmp-<pid>` 再原子 rename |
+| 状态 | `workspaceWriteMode: 'proposal'`（恒定）、`proposalPending`、`proposalPath`、`proposalPathSafe`，建议持续保留并在每轮 `warnings[]` 提示 |
 
-两种模式使用相同规则：
+**路径边界防护**：两个写入目标每次写入前做真实路径校验（`lib/workspace.js` 的 `guardedWrite`）：
+
+1. `mkdir` 后 `realpath(写入目录)` 必须位于 `realpath(dataDir)` / `realpath(stagingRoot)` 之内；
+2. 目标文件已存在且是符号链接 → 拒绝；
+3. 写入目录或目标文件 `realpath` 解析后落在 `<dshHome>/storages/` 内 → 拒绝（防 `proposed`/`staging` 被替换成指向宿主 storages 的符号链接后借 rename 覆盖/删除宿主 `workspace.json`）。
+
+校验失败计入本轮 `errors[]`、置 `proposalPathSafe: false`，不产生任何文件；测试用 `tests/.tmp` 里的真实符号链接构造了全部三类攻击并断言宿主字节不变。
+
+合并规则（与写入模式无关，始终适用）：
 
 - **无损合并**：保留本地递归键集、`global.initialized` 和未知字段；未知对象同名值保留本地，远端只补缺；`__proto__`、`constructor` 等键按自有键安全处理。`workspaceIds` / `sessionIds` 保序并集，title/path 按 `updatedAt` 选择。
 - **写前校验**：完整 v2 信封、必需字段、`workspaceIds` 属于结果表以及 default 引用完整。远端坏条目跳过并记录 error，对应索引过滤；缺失字段可由合法本地补齐。本地缺失时仅接受完整合法远端。解析失败、I/O 故障、版本不符或合并结果非法均拒写。
-- **容量边界**：每个工作区输入与合并产物最多 32MiB；workspace 表、workspaceIds 和各 sessionIds 数组最多 100000 条。输入或结果超限都报错并拒写，包含 domain 和 proposal 路径，不再截断后写入。
+- **容量边界**：每个工作区输入与合并产物最多 32MiB；workspace 表、workspaceIds 和各 sessionIds 数组最多 100000 条。输入或结果超限都报错并拒写，不再截断后写入。
 
-升级后先查看 `dsh_sync_status` 确认模式。旧宿主若未提供服务会进入 proposal；无需手工赋予插件宿主文件写权限。宿主事务是逐条一致的，不承诺整轮合并原子提交；中途失败后下一轮从实际 domain 状态继续。旧版插件产生的备份不会被新代码自动恢复或清理。
+升级注意（v1.0 → v1.1）：不再自动应用工作区索引，`dsh_sync_status` 恒显示 `proposal`；无需手工赋予插件宿主文件写权限。建议文件每轮参与合并故不会丢失，但长期不接入宿主事务 API 时工作区索引不会落盘到宿主。旧版插件产生的宿主文件备份不会被新代码自动恢复或清理。
 
 ## 工具
 
 | 工具 | 参数 | 说明 |
 |---|---|---|
-| `dsh_sync_status` | 无 | 设备、监听地址/端口、peers、会话数量、写入模式、建议状态/路径、冲突数、最近一轮结果及下次运行时间 |
-| `dsh_sync_now` | 无 | 立即同步，返回计数、`workspaceWriteMode`、`proposalPending` / `proposalPath`、`errors[]` 和 `warnings[]` |
+| `dsh_sync_status` | 无 | 设备、监听地址/端口、peers、会话数量、写入模式、建议状态/路径/路径安全（`proposalPathSafe`）、冲突数、最近一轮结果及下次运行时间 |
+| `dsh_sync_now` | 无 | 立即同步，返回计数、`workspaceWriteMode`、`proposalPending` / `proposalPath` / `proposalPathSafe`、`errors[]` 和 `warnings[]` |
 | `dsh_sync_config` | `{set?}` | 无 `set` 返回当前设置（token 打码）；有 `set` 深合并写入 `config.json`，返回 `{settings, needRestart}` |
 
 ## 日志与排查
@@ -163,8 +174,8 @@ hub 只做字节中转（`/v1/ping`、`/v1/index`、`/v1/blob`），不解析 DS
 ## 测试
 
 ```bash
-node tests/engine.test.mjs        # 端到端同步：初始同步、工作区并集、冲突、幂等零流量
-node tests/workspace.compat.test.mjs  # mock domain事务、无损合并、校验/容量拒写、proposal只读宿主
+node tests/engine.test.mjs        # 端到端同步：初始同步、工作区建议并集、冲突、幂等零流量
+node tests/workspace.compat.test.mjs  # 无损合并、校验/容量拒写、真实符号链接攻击、宿主只读
 node tests/apply.compat.test.mjs      # 跨周期冲突保护、坏zstd/JSONL、缓存校验、配置拒绝自动落回
 node tests/engine.offline.test.mjs    # 沙箱补充：真实文件与周期，内存 fetch 响应，不能代替 HTTP 验收
 node tests/fixture.accept.test.mjs    # 读取 /tmp/dsh-sync-accept 两份事故 fixture，在仓库临时目录合并

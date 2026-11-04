@@ -52,25 +52,28 @@ try {
   assert.deepEqual(await fsp.readFile(hostPath), localBytes, 'proposal模式宿主原字节完全不变')
   assert.deepEqual(await fsp.readFile(stagingPath), await fsp.readFile(proposalPath))
 
-  // 同一事故输入也走宿主domain mock，不能依靠文件回写使测试通过。
+  // 同一事故输入即使提供 domain 句柄，也必须零写入：只更新建议文件。
   const stored = structuredClone(local)
-  const table = { get size() { return Object.keys(stored.tables.workspaces).length }, entries: () => Object.entries(stored.tables.workspaces)[Symbol.iterator](), async put(id, value) { Object.defineProperty(stored.tables.workspaces, id, { value: structuredClone(value), enumerable: true, writable: true, configurable: true }) } }
-  const domain = { name: 'workspace', table(name) { assert.equal(name, 'workspaces'); return table }, global: { get: () => stored.global, async set(value) { stored.global = structuredClone(value) } } }
+  const calls = []
+  const table = { get size() { return Object.keys(stored.tables.workspaces).length }, entries: () => Object.entries(stored.tables.workspaces)[Symbol.iterator](), async put(id, value) { calls.push(['put', id]); Object.defineProperty(stored.tables.workspaces, id, { value: structuredClone(value), enumerable: true, writable: true, configurable: true }) } }
+  const domain = { name: 'workspace', table(name) { assert.equal(name, 'workspaces'); return table }, global: { get: () => stored.global, async set(value) { calls.push(['set']); stored.global = structuredClone(value) } } }
   await fsp.writeFile(stagingPath, remoteBytes)
   const applied = await mergeWorkspace({ domain, dshHome: home, stagingRoot, dataDir })
   assert.equal(applied.merged, true)
-  assert.equal(applied.workspaceWriteMode, 'domain')
-  assert.equal(applied.proposalPending, false)
+  assert.equal(applied.workspaceWriteMode, 'proposal')
+  assert.equal(applied.proposalPending, true)
+  assert.equal(applied.proposalPathSafe, true)
   assert.deepEqual(applied.errors, [])
-  check(stored)
+  assert.deepEqual(calls, [], '提供 domain 也不得调用 put/set')
+  assert.deepEqual(stored, local, 'domain 内存数据不变')
   check(applied.workspace)
-  assert.deepEqual(await fsp.readFile(hostPath), localBytes, 'domain模式宿主原字节也完全不变')
-  await assert.rejects(fsp.access(proposalPath), { code: 'ENOENT' })
+  assert.deepEqual(await fsp.readFile(hostPath), localBytes, '宿主原字节完全不变')
+  check(JSON.parse(await fsp.readFile(proposalPath, 'utf8')))
   assert.deepEqual(await fsp.readFile(localSource), localBytes, '原始fixture不修改')
   assert.deepEqual(await fsp.readFile(stagingSource), remoteBytes, '原始fixture不修改')
   console.log(`真实 fixture local sha256=${digest(localBytes)}`)
   console.log(`真实 fixture staging sha256=${digest(remoteBytes)}`)
-  console.log('domain + proposal / 合法v2 / initialized / 本地递归键 / sessionIds并集 / 宿主字节不变 ALL PASS')
+  console.log('proposal-only + 提供domain零写入 / 合法v2 / initialized / 本地递归键 / sessionIds并集 / 宿主字节不变 ALL PASS')
 } finally {
   await fsp.rm(home, { recursive: true, force: true })
 }

@@ -79,33 +79,30 @@ globalThis.fetch = async (url, init = {}) => {
 }
 
 let engine
-let currentDomain = mockDomain(doc())
-let domainLookupThrows = false
+let ignoredDomainLookups = 0
+// v1.1 引擎不再接受 domain 句柄；传入旧调用方的 getWorkspaceDomain 选项必须完全无效。
 const makeEngine = () => createEngine({ getWorkspaceDomain: () => {
-  if (domainLookupThrows) throw new Error('storageDomain暂不可用')
-  return currentDomain
+  ignoredDomainLookups++
+  return mockDomain(doc())
 }, rowConfig: {
   dshHome: home, deviceName: 'offline', listenPort: 0, token: 'test-token', settleSec: 0,
   peers: [{ name: 'remote', url: 'http://remote' }, { name: 'healthy', url: 'http://healthy' }],
 } })
-async function testDomainFailureStopsCycleWrites() {
-  const cycleHome = path.join(home, 'domain-failure-cycle')
+async function testProvidedDomainNeverWritesHost() {
+  const cycleHome = path.join(home, 'domain-ignored-cycle')
   const hostFile = path.join(cycleHome, 'storages/workspace.json')
   const hostBytes = Buffer.from(JSON.stringify(doc()))
   await fsp.mkdir(path.dirname(hostFile), { recursive: true })
   await fsp.writeFile(hostFile, hostBytes)
+  let lookups = 0
   const domain = mockDomain(doc())
   const table = domain.table('workspaces')
   const realPut = table.put
   const puts = []
-  let sets = 0
-  table.put = async (id, value) => {
-    puts.push(id)
-    if (id === 'extra') throw new Error('故障注入put')
-    await realPut(id, value)
-  }
+  table.put = async (id, value) => { puts.push(id); return realPut(id, value) }
   const realSet = domain.global.set
-  domain.global.set = async (global) => { sets++; await realSet(global) }
+  let sets = 0
+  domain.global.set = async (global) => { sets++; return realSet(global) }
   const remoteDocs = Object.fromEntries(['one', 'two'].map((peer) => {
     const value = doc()
     value.tables.workspaces.ws.sessionIds.push(peer)
@@ -114,7 +111,6 @@ async function testDomainFailureStopsCycleWrites() {
     return [peer, Buffer.from(JSON.stringify(value))]
   }))
   const previousFetch = globalThis.fetch
-  const fetchedPeers = new Set()
   globalThis.fetch = async (url, init = {}) => {
     if (init.method === 'PUT') return Response.json({ ok: true })
     const parsed = new URL(url)
@@ -122,27 +118,31 @@ async function testDomainFailureStopsCycleWrites() {
     if (parsed.pathname === '/v1/index') return Response.json({ files: {
       'workspace/workspace.json': { sha1: sha1(bytes), size: bytes.length },
     } })
-    fetchedPeers.add(parsed.hostname)
     return new Response(bytes)
   }
-  const cycleEngine = createEngine({ getWorkspaceDomain: () => domain, rowConfig: {
-    dshHome: cycleHome, listenPort: 0, token: 'failure-token', settleSec: 0,
+  const cycleEngine = createEngine({ getWorkspaceDomain: () => { lookups++; return domain }, rowConfig: {
+    dshHome: cycleHome, listenPort: 0, token: 'ignored-token', settleSec: 0,
     peers: [{ name: 'one', url: 'http://one' }, { name: 'two', url: 'http://two' }],
   } })
   try {
     await cycleEngine.init()
     const result = await cycleEngine.runCycle()
-    assert.ok(result.errors.some((message) => message.includes('故障注入put')))
-    assert.deepEqual([...fetchedPeers].sort(), ['one', 'two'], '失败后仍完成后续peer拉取')
-    assert.deepEqual(puts, ['ws', 'extra'], '首次写失败后本轮后续peer不能再次put')
-    assert.equal(sets, 0, '失败后global.set从未调用')
-    assert.deepEqual(domain.document().tables.workspaces.ws.sessionIds, ['session', 'one'], '失败前已成功单条写保留')
-    assert.deepEqual(await fsp.readFile(hostFile), hostBytes, '失败后绝不回滚或改写宿主文件')
+    assert.equal(result.workspaceWriteMode, 'proposal')
+    assert.equal(result.proposalPending, true)
+    assert.deepEqual(result.errors, [])
+    assert.equal(lookups, 0, '引擎从不读取传入的domain句柄')
+    assert.deepEqual(puts, [], '即使传入 domain 也从未调用 put')
+    assert.equal(sets, 0, '即使传入 domain 也从未调用 global.set')
+    assert.deepEqual(domain.document(), doc(), 'domain 数据不变')
+    assert.deepEqual(await fsp.readFile(hostFile), hostBytes, '宿主文件字节不变')
+    const proposal = JSON.parse(await fsp.readFile(path.join(cycleHome, 'plugin-sync/proposed/workspace.json'), 'utf8'))
+    assert.deepEqual([...new Set(proposal.tables.workspaces.ws.sessionIds)].sort(), ['one', 'session', 'two'], '建议文件 sessionIds 为并集')
+    assert.ok(Object.hasOwn(proposal.tables.workspaces, 'extra'), '合法远端独有条目进入建议')
   } finally {
     await cycleEngine.close()
     globalThis.fetch = previousFetch
   }
-  console.log('离线 W2 domain部分put成功/后续put失败/后续peer整轮停止domain写 PASS')
+  console.log('离线 V1 提供domain句柄也不写宿主（零put/set/宿主字节不变/建议并集） PASS')
 }
 
 async function testPluginEntryLifecycle() {
@@ -151,50 +151,31 @@ async function testPluginEntryLifecycle() {
   const hostBytes = Buffer.from(JSON.stringify(doc()))
   await fsp.mkdir(path.dirname(hostFile), { recursive: true })
   await fsp.writeFile(hostFile, hostBytes)
-  for (const injectThrows of [false, true]) {
-    const registered = new Map()
-    const disposers = []
-    const injectedDisposers = []
-    let injectCallback
-    const ctx = {
-      inject(names, callback) {
-        assert.deepEqual(names, ['storageDomain'])
-        if (injectThrows) throw new Error('可选服务未安装')
-        injectCallback = callback
-      },
-      effect(fn) { const dispose = fn(); if (typeof dispose === 'function') disposers.push(dispose); return dispose },
-      tools: { register(tool) { registered.set(tool.name, tool); return () => registered.delete(tool.name) } },
-    }
-    try {
-      applyPlugin(ctx, { dshHome: entryHome, listenPort: 0, token: 'entry-token', settleSec: 0 })
-      const status = () => registered.get('dsh_sync_status').execute()
-      const sync = () => registered.get('dsh_sync_now').execute()
-      assert.equal((await status()).workspaceWriteMode, 'proposal')
-      assert.equal((await sync()).proposalPending, true, '缺少可选服务仍能执行工具')
-      if (!injectThrows) {
-        const domain = mockDomain(doc())
-        injectCallback({
-          storageDomain: { get(name) { assert.equal(name, 'workspace'); return domain } },
-          effect(fn) { const dispose = fn(); if (typeof dispose === 'function') injectedDisposers.push(dispose) },
-        })
-        assert.equal((await sync()).workspaceWriteMode, 'domain')
-        assert.equal((await status()).proposalPending, false)
-        for (const dispose of injectedDisposers.splice(0).reverse()) await dispose()
-        assert.equal((await status()).workspaceWriteMode, 'proposal', '服务卸载清除旧句柄')
-        assert.equal((await sync()).proposalPending, true)
-      }
-      assert.deepEqual(await fsp.readFile(hostFile), hostBytes)
-    } finally {
-      for (const dispose of injectedDisposers.reverse()) await dispose()
-      for (const dispose of disposers.reverse()) await dispose()
-    }
+  const registered = new Map()
+  const disposers = []
+  const injectCalls = []
+  const ctx = {
+    inject(names) { injectCalls.push(names) },
+    effect(fn) { const dispose = fn(); if (typeof dispose === 'function') disposers.push(dispose); return dispose },
+    tools: { register(tool) { registered.set(tool.name, tool); return () => registered.delete(tool.name) } },
   }
-  console.log('离线 index.apply可选注入缺失/抛错/就绪/卸载生命周期 PASS')
+  try {
+    applyPlugin(ctx, { dshHome: entryHome, listenPort: 0, token: 'entry-token', settleSec: 0 })
+    const status = () => registered.get('dsh_sync_status').execute()
+    const sync = () => registered.get('dsh_sync_now').execute()
+    assert.deepEqual(injectCalls, [], 'v1.1 不再请求注入 storageDomain')
+    assert.equal((await status()).workspaceWriteMode, 'proposal')
+    assert.equal((await sync()).proposalPending, true, '不注入任何服务也能执行工具')
+    assert.equal((await status()).proposalPathSafe, true)
+    assert.deepEqual(await fsp.readFile(hostFile), hostBytes, '宿主文件字节不变')
+  } finally {
+    for (const dispose of disposers.reverse()) await dispose()
+  }
+  console.log('离线 index.apply不再注入storageDomain/工具全程proposal/宿主只读 PASS')
 }
 
 try {
   for (const bytes of [undefined, '{bad JSON', 'null', '{"localHashes":null,"remoteHashes":[]}']) {
-    currentDomain = mockDomain(doc())
     remoteBody = remoteBytes
     remoteIndex = { files: { [rel]: { sha1: sha1(remoteBytes), size: remoteBytes.length } } }
     await write(rel, localBytes)
@@ -232,7 +213,6 @@ try {
 
   const hostBytes = Buffer.from(JSON.stringify(doc()))
   await write('storages/workspace.json', hostBytes)
-  currentDomain = null
   remoteBody = Buffer.from('proposal attachment')
   remoteIndex = { files: { 'attachments/proposal.bin': { sha1: sha1(remoteBody), size: remoteBody.length } } }
   engine = makeEngine()
@@ -265,23 +245,15 @@ try {
   assert.equal((await engine.status()).proposalPending, true, '建议仍在时拒绝后续合并不能清除pending状态')
   assert.deepEqual(JSON.parse(await fsp.readFile(proposalStatus.proposalPath, 'utf8')), pendingDoc)
   await write('storages/workspace.json', hostBytes)
-  currentDomain = mockDomain(doc())
-  const domainCycle = await engine.runCycle()
-  assert.equal(domainCycle.workspaceWriteMode, 'domain', '服务就绪后同一引擎切换domain')
-  assert.deepEqual(currentDomain.document().tables.workspaces.ws.sessionIds, ['session', 'proposal-session'], '服务恢复后应用跨周期保留的建议')
-  assert.equal((await engine.status()).proposalPending, false)
+  const restoredCycle = await engine.runCycle()
+  assert.equal(restoredCycle.workspaceWriteMode, 'proposal', '宿主恢复后仍只写建议文件')
+  assert.deepEqual(JSON.parse(await fsp.readFile(proposalStatus.proposalPath, 'utf8')).tables.workspaces.ws.sessionIds, ['session', 'proposal-session'], '宿主恢复后建议并集保留')
   assert.deepEqual(await fsp.readFile(path.join(home, 'storages/workspace.json')), hostBytes)
-  domainLookupThrows = true
-  const unavailableCycle = await engine.runCycle()
-  assert.equal(unavailableCycle.workspaceWriteMode, 'proposal', '可选服务读取失败安全降级')
-  assert.equal(unavailableCycle.proposalPending, true)
-  assert.deepEqual(await fsp.readFile(path.join(home, 'storages/workspace.json')), hostBytes)
-  domainLookupThrows = false
-  currentDomain = mockDomain(doc())
+  assert.equal(ignoredDomainLookups, 0, '引擎从不读取传入的domain句柄')
   await engine.close()
-  console.log('离线 W1-W3 proposal状态/跨周期建议并集/附件同步/宿主字节不变/动态服务 PASS')
+  console.log('离线 V1-V3 proposal状态/跨周期建议并集/附件同步/宿主字节不变/忽略domain句柄 PASS')
   await testPluginEntryLifecycle()
-  await testDomainFailureStopsCycleWrites()
+  await testProvidedDomainNeverWritesHost()
 
   await assert.rejects(requestBuffer('http://remote/slow', {}, { timeoutMs: 30 }), /超时/)
   await assert.rejects(requestBuffer('http://remote/chunked', {}, { maxBytes: 1024 }), /上限/)
@@ -374,7 +346,6 @@ try {
     await assert.rejects(fsp.access(path.join(home, 'attachments/oversized.bin')))
   }
   remoteIndex = { files: {} }; indexHeader = undefined; blobHeader = undefined
-  currentDomain = null
   await write('storages/workspace.json', '{bad')
   assert.ok((await engine.runCycle()).errors.some((e) => e.includes('JSON 解析失败')), 'N1首次合并error汇总')
   await write('storages/workspace.json', JSON.stringify(doc()))
