@@ -67,3 +67,36 @@ tests/engine.test.mjs               PASS（真实 HTTP 双节点）
   `cp /tmp/ws-before-enable.json ~/.dsh/storages/workspace.json`。
 - 工作区索引：当前只生成建议文件，不会自动应用；如需在某台设备应用，人工核对
   `~/.dsh/plugin-sync/proposed/workspace.json` 后按需处理（后续版本等宿主事务 API 再做自动应用）。
+
+---
+
+# v1.2 验收记录（PM 填写）
+
+日期：2026-11-04 开发完成，待 Codex 审核与 PM 实机验收。分支 `feat/v1.2-registry-apply`，版本 `1.2.0`。
+
+## 0. 功能概述
+
+宿主提供 `ctx.workspaceRegistry` / `ctx.sessionPersistence` 事务 API 时，每轮同步在 apply 之后经该 API **自动应用**工作区/会话增量（`workspaceWriteMode: 'registry'`）；服务不可用自动回退 v1.1.2 proposal 模式。插件仍然**不写任何宿主 JSON 文件**（applier 零 fs 写调用，文件写继续收敛 safe-writer）。
+
+## 1. 开发侧自检（Claude Code，已实测）
+
+| 门槛 | 结果 |
+|---|---|
+| `node --check`（index.js + hub.mjs + lib/*.js(11) + tests/*.mjs(7)） | 全部 exit 0 |
+| `node tests/registry.test.mjs` | exit 0，8 类场景 + engine/index 接入 9 组 ALL PASS（纯 mock） |
+| 既有 6 个测试（workspace.compat / apply.compat / engine.offline / fixture.accept / security.symlink / engine） | 全部 exit 0，ALL PASS |
+| grep：registry-apply.js 无 fs 写调用 | 通过（仅 `fsp.stat` 只读） |
+| grep：无宿主 storages 文件写 | 通过（`storages/workspace.json` 仍只有 2 处只读） |
+
+## 2. Codex 审核（待填写）
+
+| 轮次 | 结论 | BLOCKER/NIT |
+|---|---|---|
+
+## 3. PM 实机验收（待填写）
+
+- [ ] 重载插件（bundle 关→开），`dsh_sync_status` 显示 `workspaceWriteMode: 'registry'`、`registryAvailable: true`；
+- [ ] 从对端拉来的会话出现在本机对应工作区，且宿主 `storages/workspace.json` 的变化**由宿主自身写入**（`domain/changed` / registry mutation queue），可证明非插件 safe-writer 所为（对比启用前后 sha256 与插件写面自检）；
+- [ ] 幂等：连续两轮 `dsh_sync_now`，第二轮 `registryApplied` 的 created/sessions/archived/pinned/titles 为 0；
+- [ ] 降级：临时移除 registry 服务注入后，`workspaceWriteMode` 回到 `'proposal'` 且行为同 v1.1.2；
+- [ ] 宿主文件 sha256 记录：启用前 ________ / 启用后 ________（应仅由宿主自身操作引起变化）。

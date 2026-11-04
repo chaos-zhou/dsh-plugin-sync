@@ -6,8 +6,28 @@ import { createLogger } from './lib/log.js'
 export const inject = ['tools']
 
 export function apply(ctx, config) {
-  // v1.1 起插件不写宿主工作区索引，也不再注入 storageDomain；合并结果只写建议文件。
-  const engine = createEngine({ rowConfig: config || {} })
+  // v1.1 起插件不写宿主工作区索引；v1.2 可选注入宿主 workspaceRegistry/sessionPersistence，
+  // 服务可用时经宿主事务 API 自动应用索引（registry 模式），否则回退 proposal 模式。
+  // 拿不到（宿主无 inject/服务缺失/抛错）一律解析为 null，绝不抛出。
+  const services = (async () => {
+    try {
+      if (typeof ctx?.inject !== 'function') return null
+      let callbackArgs = null
+      const collect = (...args) => { callbackArgs = args.length === 1 ? args[0] : args }
+      const out = await ctx.inject(['workspaceRegistry', 'sessionPersistence'], collect)
+      for (const value of [out, callbackArgs]) {
+        if (Array.isArray(value)) return { workspaceRegistry: value[0], sessionPersistence: value[1] }
+        if (value && typeof value === 'object') {
+          return { workspaceRegistry: value.workspaceRegistry ?? null, sessionPersistence: value.sessionPersistence ?? null }
+        }
+      }
+      return null
+    } catch {
+      return null
+    }
+  })()
+
+  const engine = createEngine({ rowConfig: config || {}, services })
   const ready = engine.init().catch((e) => {
     // 不能抛到宿主：兜底日志经 safe-writer 的 logger（目标为符号链接时安全拒绝）
     if (engine.dataDir) {

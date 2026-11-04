@@ -7,6 +7,8 @@ DSH 多端同步插件：在两台（或多台）安装了 DSH 的设备之间�
 > **v1.1.1 安全收口**：新增统一写防护层 `lib/safe-writer.js`，插件所有落盘路径（含日志、state、blob）都经过符号链接/边界校验；`<dshHome>/storages` 本身为符号链接时判定危险配置并拒绝一切写入。详见「路径边界防护」。
 >
 > **v1.1.2 安全补强**：日志追加/轮转增加硬链接防护（目标 `nlink>1` 拒绝，打开后 `fstat` 复核），日志拒绝不再静默而是计入本轮 `errors[]`；目录创建收敛到 `guardedMkdir`（`plugin-sync` 或 `storages` 被符号链接劫持时初始化零创建）；safe-writer 全部内部异常转为结构化拒绝。同时如实声明防护能力边界（`O_NOFOLLOW` 只保护最后一级、校验与 `rename` 之间存在 TOCTOU 窗口），详见「路径边界防护」。
+>
+> **v1.2 自动应用**：宿主提供 `ctx.workspaceRegistry` / `ctx.sessionPersistence` 事务 API 时，插件在每轮 apply 之后经该 API 把合并结果**增量应用**到本机工作区/会话列表（registry 模式）——仍然**不写任何宿主 JSON 文件**；服务不可用时自动回退 v1.1.2 的 proposal 模式。详见「自动应用（registry 模式）」。
 
 ## 安装
 
@@ -107,7 +109,7 @@ hub 只做字节中转（`/v1/ping`、`/v1/index`、`/v1/blob`），不解析 DS
 | 附件 | `attachments/**` | 同名路径 |
 | 摘要缓存 | `storages/session_projcache/sessions/*.json` | `projcache/sessions/*.json` |
 | 插件配置 | `profiles/*/cordis.patch.yml` | `config/<profile>/cordis.patch.yml`（保留导出，暂停自动写回） |
-| 工作区索引 | 只读参考宿主 `storages/workspace.json` | `workspace/workspace.json`（无损合并，只生成建议，不写宿主） |
+| 工作区索引 | 只读参考宿主 `storages/workspace.json` | `workspace/workspace.json`（无损合并；生成建议文件，registry 可用时另经宿主事务 API 自动应用） |
 
 **从不传输**：`plugin-sync/`（自身数据）、`node_modules/`、`electron/`、`speech-to-text/`、`cache/`、`llm-deepseek/`、`.credentials.yaml`、`.anonymous-user-id`、所有 `*.lock` 文件。已知落盘统一经 `lib/safe-writer.js`（含目录创建与日志，见「路径边界防护」）：先以 `O_CREAT|O_EXCL|O_NOFOLLOW` 创建 `.tmp-<basename>.<pid>.<rand>` 临时文件，再原子 rename 到目标，对端不会读到半个文件。
 
@@ -130,16 +132,43 @@ hub 只做字节中转（`/v1/ping`、`/v1/index`、`/v1/blob`），不解析 DS
 
 ## 工作区索引写入模式
 
-v1.1 起**只有 proposal 模式**：插件绝不写宿主 `storages/workspace.json`，也不再请求注入宿主 `storageDomain` 服务。合并结果只写入 `<dataDir>/proposed/workspace.json`（`dataDir` 为 `<dshHome>/plugin-sync`），另写一份 `staging/workspace/workspace.json` 副本随同步推给对端；应用到宿主需等宿主提供事务 API 或人工处理。
+v1.2 起有两种模式，由宿主是否提供事务 API 自动决定（`dsh_sync_status` / `dsh_sync_now` 的 `workspaceWriteMode` 字段）：
 
-为什么取消 domain 写路径：宿主 domain 只有 get/set/put/delete/update，没有事务/CAS/版本号 API。v1.1 之前的方案是「快照 → 逐条 put → global.set」的读改写——put 等待期间宿主一旦更新工作区/置顶，最后的 global.set 会用旧快照的合并结果整体覆盖宿主新数据，插件侧无法安全修复，因此整条路径移除（即使外部代码传入 domain 句柄，插件也只记 warning 并忽略）。
+- **registry 模式**（`workspaceWriteMode: 'registry'`）：宿主提供 `ctx.workspaceRegistry` 与 `ctx.sessionPersistence` 时，每轮 apply 之后把合并结果经宿主事务 API 增量应用到本机。**插件仍不写任何宿主 JSON 文件**——所有变更都是宿主 mutation queue 内的单条持久化操作，宿主自己落盘并发 `domain/changed` 事件。
+- **proposal 模式**（`workspaceWriteMode: 'proposal'`，v1.1.2 行为）：服务不可用（宿主无 inject、服务缺失、注入抛错）时自动回退；合并结果只写建议文件，等待人工应用。
 
-| 项目 | 行为 |
+两种模式下 proposal 文件都继续生成（审计与降级后备），只是 registry 模式不再提示「待人工应用」。
+
+### 自动应用（registry 模式）
+
+实现位于 `lib/registry-apply.js`，每轮 `cycle()` 在会话/附件落回（apply）**之后**执行——这样本轮刚同步过来的会话文件有机会被宿主识别，下一轮即可 attach。
+
+**输入**：staging 里合并后的 `workspace/workspace.json`（含远端工作区、归档/置顶集合的并集）＋从 registry 实时读取的本机现状。每轮都重新读现状算差量，不缓存本地快照。
+
+**只使用这些宿主 API**：`workspaceRegistry.create / resolveByPath / archiveSession / pinSession`、`Workspace.attachSession / setTitle`、`sessionPersistence.stat`。`lib/registry-apply.js` 内没有任何 fs 写调用（仓库 grep 自检佐证）；unarchive/unpin/insertBefore 等减序 API 一律不调用——**远端状态只加不减**。
+
+| 步骤 | 行为 |
+|---|---|
+| 归档/置顶 | 远端 `archivedSessionIds` / `pinnedSessionIds` 逐条增量：宿主未识别（`stat` 缺失）→ warning 跳过下轮重试；归档活动中的会话（`WorkspaceActiveSessionError`）→ warning 跳过，**绝不 `stopActivity` 强停用户会话**；pin 已归档/不存在 → warning 跳过 |
+| 工作区 | 远端 `path` 先过 `pathRemap` 映射，再 `fs.stat` 确认本地是真实目录（缺失/不是目录 → warning 跳过该工作区及其全部会话）；`resolveByPath` 未命中才 `create(path, title)`（目录复用，不重命名） |
+| 会话 | 远端 `sessionIds` 中本工作区尚没有的 id：宿主未识别 → warning 下轮重试；否则 `attachSession`（已存在不重复 attach） |
+| 标题 | 仅当远端标题非空、与本地不同、且**本地标题仍等于本地目录 basename**（即从未被本地改过名）时 `setTitle(remote.title)`；本地已改名则保留本地标题，避免两端改名互相覆盖/震荡；规则单调，收敛后不再调用 |
+
+**幂等与并发语义**：attach/archive/pin/setTitle 都是宿主 mutation queue 内的单条持久化操作，重复调用应无害（已 attach 不重复、已归档/已置顶为 no-op、标题规则单调）。全部已存在时一轮的增量为零（`registryApplied` 各计数为 0，仅 `workspaces` 表示「确认存在」的工作区数，其中 `created` 为本轮实际新建数）。单条失败记入 `registryWarnings[]`，下一轮自动重试，**不做整轮回滚**。
+
+**跨系统路径映射**：远端工作区路径先用配置 `pathRemap: [{from, to}]` 做字符串替换（与 proposal 合并同一实现 `applyRemap`），例如 macOS 的 `/Users/x/proj` ↔ Linux 的 `/home/x/proj`。映射后本地不存在的工作区整条跳过（含其会话），不猜测、不创建目录。
+
+**失败契约**：applier 自身不抛出——单条失败一律转 `registryWarnings[]`（前缀 `registry:`）并计入 `dsh_sync_status`；只有 staging 文档读取失败/信封无效这类无法继续的情况才升级为本轮 `errors[]`。状态字段：`registryAvailable`（本轮服务是否可用）、`registryApplied`（本轮增量 `{workspaces, created, sessions, archived, pinned, titles}`）、`registryLastApplied`（最近一次成功应用摘要）、`registryWarnings`（最近一轮的警告）。
+
+**安全约束不变**：不写宿主文件、全部文件写仍经 `lib/safe-writer.js`、proposal 持续生成。若需要回退到纯 proposal 行为，把插件 bundle 换回 v1.1.2 或在宿主侧停掉 registry 服务注入即可。
+
+v1.1 历史设计（为何不直接写宿主 `storages/workspace.json`）：宿主 domain 只有 get/set/put/delete/update，没有事务/CAS/版本号 API。「快照 → 逐条 put → global.set」的读改写在 put 等待期间宿主一旦更新工作区/置顶，最后的 global.set 会用旧快照整体覆盖宿主新数据，插件侧无法安全修复，因此整条路径已移除（即使外部代码传入 domain 句柄，插件也只记 warning 并忽略）。v1.2 的 registry API 是宿主提供的队列化事务写，才重新接管应用。
+
+| 项目 | 行为（proposal 模式 / registry 模式下的 proposal 副产物） |
 |---|---|
 | 读取 | 宿主 `storages/workspace.json` 只读（32MiB 有界三态读取）；解析失败/读取失败中止合并；缺失时按既有建议/远端继续合并（本地缺失时仅接受完整合法远端）。绝不写宿主文件 |
 | 写入 | `<dataDir>/proposed/workspace.json` 与 `<dataDir>/staging/workspace/workspace.json`，经 `lib/safe-writer.js` 先写 `O_NOFOLLOW` 独占临时文件再原子 rename |
-| 状态 | `workspaceWriteMode: 'proposal'`（恒定）、`proposalPending`、`proposalPath`、`proposalPathSafe`，建议持续保留并在每轮 `warnings[]` 提示 |
-
+| 状态 | `workspaceWriteMode`、`proposalPending`、`proposalPath`、`proposalPathSafe`；proposal 模式下建议在每轮 `warnings[]` 提示，registry 模式下不再提示 |
 **路径边界防护（v1.1.2，统一 safe-writer）**：插件的已知落盘路径（proposal、staging、日志、state.json、config.json、blob、目录创建、会话/附件/摘要缓存落回）都收敛到 `lib/safe-writer.js` 的统一防护层（仓库内有 grep 自检佐证，见 FIX-REPORT）：
 
 1. **数据目录边界**：init 时 `assertSafeRoot(dataDir)` 校验插件数据目录本身不在宿主 `storages/` 内；若 `<dshHome>/storages` 本身是符号链接（含悬空），判定为危险配置，**拒绝一切写入与目录创建**（config 播种、日志、proposal、state 全部拒绝），错误计入 `errors[]`。
@@ -160,14 +189,14 @@ v1.1 起**只有 proposal 模式**：插件绝不写宿主 `storages/workspace.j
 - **写前校验**：完整 v2 信封、必需字段、`workspaceIds` 属于结果表以及 default 引用完整。远端坏条目跳过并记录 error，对应索引过滤；缺失字段可由合法本地补齐。本地缺失时仅接受完整合法远端。解析失败、I/O 故障、版本不符或合并结果非法均拒写。
 - **容量边界**：每个工作区输入与合并产物最多 32MiB；workspace 表、workspaceIds 和各 sessionIds 数组最多 100000 条。输入或结果超限都报错并拒写，不再截断后写入。
 
-升级注意（v1.0 → v1.1）：不再自动应用工作区索引，`dsh_sync_status` 恒显示 `proposal`；无需手工赋予插件宿主文件写权限。建议文件每轮参与合并故不会丢失，但长期不接入宿主事务 API 时工作区索引不会落盘到宿主。旧版插件产生的宿主文件备份不会被新代码自动恢复或清理。
+升级注意（v1.0 → v1.1 → v1.2）：v1.1 起不再直接写宿主工作区索引文件，无需手工赋予插件宿主文件写权限；v1.2 在宿主提供 `workspaceRegistry`/`sessionPersistence` 事务 API 时恢复**自动应用**（经宿主 API、不落插件文件写）。建议文件每轮参与合并故不会丢失。旧版插件产生的宿主文件备份不会被新代码自动恢复或清理。
 
 ## 工具
 
 | 工具 | 参数 | 说明 |
 |---|---|---|
-| `dsh_sync_status` | 无 | 设备、监听地址/端口、peers、会话数量、写入模式、建议状态/路径/路径安全（`proposalPathSafe`）、冲突数、最近一轮结果及下次运行时间 |
-| `dsh_sync_now` | 无 | 立即同步，返回计数、`workspaceWriteMode`、`proposalPending` / `proposalPath` / `proposalPathSafe`、`errors[]` 和 `warnings[]` |
+| `dsh_sync_status` | 无 | 设备、监听地址/端口、peers、会话数量、写入模式（`workspaceWriteMode` / `registryAvailable` / `registryLastApplied` / `registryWarnings`）、建议状态/路径/路径安全（`proposalPathSafe`）、冲突数、最近一轮结果及下次运行时间 |
+| `dsh_sync_now` | 无 | 立即同步，返回计数、`workspaceWriteMode`、`registryApplied` / `registryWarnings`、`proposalPending` / `proposalPath` / `proposalPathSafe`、`errors[]` 和 `warnings[]` |
 | `dsh_sync_config` | `{set?}` | 无 `set` 返回当前设置（token 打码）；有 `set` 深合并写入 `config.json`，返回 `{settings, needRestart}` |
 
 ## 日志与排查
@@ -190,6 +219,7 @@ node tests/apply.compat.test.mjs      # 跨周期冲突保护、坏zstd/JSONL、
 node tests/engine.offline.test.mjs    # 沙箱补充：真实文件与周期，内存 fetch 响应，不能代替 HTTP 验收
 node tests/fixture.accept.test.mjs    # 读取 /tmp/dsh-sync-accept 两份事故 fixture，在仓库临时目录合并
 node tests/security.symlink.test.mjs  # 14 组攻击：符号链接/硬链接/目录污染/故障注入，宿主字节不变、零写系统调用
+node tests/registry.test.mjs          # v1.2 registry 应用：8 类场景（命中/幂等/stat缺失/缺目录/archive-pin/标题/降级/异常）+ engine/index 接入，纯 mock
 ```
 
 各测试成功均输出 `ALL PASS`；HTTP 测试需要允许本机端口监听。
