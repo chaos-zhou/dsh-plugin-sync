@@ -17,7 +17,8 @@ export function apply(ctx, config) {
   })
 
   ctx.effect(() => {
-    engine.startTimer()
+    // 定时器必须在 init() 读到 settings 之后再启动，否则 settings 还是 undefined
+    ready.then(() => engine.startTimer()).catch(() => {})
     return () => engine.close()
   })
 
