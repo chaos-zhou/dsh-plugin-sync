@@ -1,7 +1,7 @@
-import fsp from 'node:fs/promises'
 import path from 'node:path'
 import { createEngine } from './lib/engine.js'
 import { publicSettings } from './lib/config.js'
+import { createLogger } from './lib/log.js'
 
 export const inject = ['tools']
 
@@ -9,11 +9,11 @@ export function apply(ctx, config) {
   // v1.1 起插件不写宿主工作区索引，也不再注入 storageDomain；合并结果只写建议文件。
   const engine = createEngine({ rowConfig: config || {} })
   const ready = engine.init().catch((e) => {
-    // 不能抛到宿主：尽力写入日志文件
-    const dir = path.join(engine.dataDir || '', 'logs')
-    fsp.mkdir(dir, { recursive: true })
-      .then(() => fsp.appendFile(path.join(dir, 'sync.log'), `${new Date().toISOString()} [error] init 失败: ${e?.message || e}\n`))
-      .catch(() => {})
+    // 不能抛到宿主：兜底日志经 safe-writer 的 logger（目标为符号链接时安全拒绝）
+    if (engine.dataDir) {
+      const logger = createLogger(path.join(engine.dataDir, 'logs'))
+      logger.write('error', `init 失败: ${e?.message || e}`).catch(() => {})
+    }
     return null
   })
 

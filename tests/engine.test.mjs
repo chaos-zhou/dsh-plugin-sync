@@ -326,10 +326,12 @@ async function main() {
     backdate(path.join(homeA, SESS_A))
     await writeFileRel(homeA, ATT_A, Buffer.from('attachment-bytes-A'))
     await writeFileRel(homeA, path.join('storages', 'workspace.json'), JSON.stringify(wsFor('sess-aaa', 'ProjX', 2000)))
+    const hostABytes = await fsp.readFile(path.join(homeA, 'storages', 'workspace.json'))
 
     await writeFileRel(homeB, SESS_B, contentB1)
     backdate(path.join(homeB, SESS_B))
     await writeFileRel(homeB, path.join('storages', 'workspace.json'), JSON.stringify(wsFor('sess-bbb', 'ProjY', 2500)))
+    const hostBBytes = await fsp.readFile(path.join(homeB, 'storages', 'workspace.json'))
 
     const rA1 = await engineA.runCycle()
     assert.ok(!rA1.skipped, 'cycle 未被跳过')
@@ -408,15 +410,14 @@ async function main() {
     assert.strictEqual(sha1(await fsp.readFile(path.join(homeA, SESS_A))), sha1(contentA2), 'A 本地 sha1 仍不变')
     assert.strictEqual(sha1(await fsp.readFile(path.join(homeB, SESS_A))), sha1(contentB2), 'B 本地 sha1 仍不变')
 
-    assert.deepStrictEqual(
-      JSON.parse(await fsp.readFile(path.join(homeA, 'storages/workspace.json'), 'utf8')),
-      wsFor('sess-aaa', 'ProjX', 2000),
-      'proposal模式从未改宿主文件哨兵A',
+    // v5：宿主哨兵按初始 Buffer 原始字节比较，任何重排/重序列化都会失败。
+    assert.ok(
+      (await fsp.readFile(path.join(homeA, 'storages/workspace.json'))).equals(hostABytes),
+      'proposal模式从未改宿主文件哨兵A（原始字节）',
     )
-    assert.deepStrictEqual(
-      JSON.parse(await fsp.readFile(path.join(homeB, 'storages/workspace.json'), 'utf8')),
-      wsFor('sess-bbb', 'ProjY', 2500),
-      'proposal模式从未改宿主文件哨兵B',
+    assert.ok(
+      (await fsp.readFile(path.join(homeB, 'storages/workspace.json'))).equals(hostBBytes),
+      'proposal模式从未改宿主文件哨兵B（原始字节）',
     )
     await testStateRecovery()
     await testResourceLimitsAndErrors()

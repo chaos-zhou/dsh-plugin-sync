@@ -153,3 +153,55 @@ v4 决策：**v1.1 起插件完全不写宿主工作区索引**，`workspaceWrit
 3. `tests/engine.test.mjs` 依赖环境放行本机端口监听；换环境重跑前不能视为永久通过。
 4. 无原生 zstd 解压能力的 Node（如 20.x）会话自动落回保守拒绝（推送/拉取到 staging 不受影响）；需 Node ≥ 22.15/23.8+。
 5. 规格验收第 6 条「更新后的 FIX-REPORT 与代码一致」已满足，但「交 Codex 第四轮审核」尚未执行，送审前待 PM 安排。
+
+---
+
+# Claude Code 本轮（v5 安全收口）
+
+日期：2026-11-04。环境：Node.js v24.15.0，macOS（本机端口监听可用）。
+
+依据 FIX-SPEC-v5 完成 S1–S4。背景：v4 只防护了 proposal/staging 两个工作区写入目标，其余写路径（`atomicWrite`、日志追加、blob 写入、peer 拉取落盘、apply 落回、config 播种）都不校验符号链接——攻击者把插件任一可写位置（如 `plugin-sync/logs/sync.log`、staging 会话路径）替换成指向宿主 `storages/workspace.json` 的符号链接，即可借插件的合法写入追加/覆盖宿主文件；`<dshHome>/storages` 本身被替换成符号链接时同样缺乏统一拦截。
+
+## 对 v4 章节的更正（S4）
+
+- V2 的「`lib/workspace.js guardedWrite`」已被 v5 取代：防护逻辑迁移到统一的 `lib/safe-writer.js` 并覆盖**所有**写路径，`lib/workspace.js` 不再持有本地 guardedWrite/storagesReal 实现。v4 行文「校验失败统一置 `proposalPathSafe: false`」同步收窄：只有 proposal 目标被拒才置 false，staging 副本被拒不影响该标志。
+- V5 版本号：`package.json` 现为 **1.1.1**。
+
+## 逐项修复（位置 → 测试 → 结果）
+
+测试列：安全 = `tests/security.symlink.test.mjs`（7 组），工作区 = `tests/workspace.compat.test.mjs`（15 组），apply = `tests/apply.compat.test.mjs`，离线 = `tests/engine.offline.test.mjs`，fixture = `tests/fixture.accept.test.mjs`，HTTP = `tests/engine.test.mjs`。
+
+| 项目 | 位置与行为 | 测试 | 结果 |
+|---|---|---|---|
+| S1 统一写防护层 | 新增 `lib/safe-writer.js`：`isSafeRel`（:36，拒绝对路径/盘符/反斜线/NUL/点段）、`assertSafeRoot`（:110，init 时校验数据目录边界；`storages` 为符号链接含悬空 → 危险配置，后续一切写入拒绝）、`guardedWrite`（:228，从文件系统根逐级 `lstat` 祖先链拒任何符号链接祖先；逐级 `mkdir`+realpath 复核；目标已存在为链接即拒；临时文件 `.tmp-<basename>.<pid>.<rand>` 以 `O_CREAT\|O_EXCL\|O_NOFOLLOW` 独占创建再 rename；写后 `lstat`+`realpath` 复核为普通文件且仍在 root 内）、`guardedAppend/guardedRotate`（:304/:338，日志追加与 2MiB 轮转，`O_APPEND\|O_NOFOLLOW` 打开后 `fstat` 复核）、`guardedRemove`（:362，目标 lstat 优先，ENOENT 幂等）、`assertApplyTarget`（:411，落回专属：父级符号链接、父目录 realpath 为 storages、目标解析为 `storages/workspace.json` 均拒绝）。失败统一返回结构化 `{ok:false, code, error}` 不抛出，并按 round 键记入 `rejectedTargets` WeakMap（:20/:58/:140）——同轮内被拒目标不再重试（错误含「不再重试」），直接调用（测试）用独立 round 可修复后重试。 | 安全 7 组（攻击 1/2/4/5/6 直接覆盖）+ 工作区既有 3 组真实符号链接攻击保持通过。 | PASS |
+| S2 全写路径接入 | `lib/util.js:29 atomicWrite` 改经 guardedWrite（hub.mjs 等无 dshHome 调用方自动降级为结构校验）；`lib/config.js:61/:67` 播种与 saveConfig（播种失败不再阻塞启动，记 `seedError` 警告）；`lib/log.js:16-18` 追加+轮转；`lib/store.js:23` blob 写入；`lib/export.js:23/:121` staging 导出与工作区副本；`lib/workspace.js:467/:474` proposal 与 staging（round 透传，proposal 被拒置 `proposalPathSafe:false`）；`lib/apply.js:25/:30` 落回（`assertApplyTarget` + guardedWrite，round 透传）；`lib/engine.js:164` init 边界校验、`:384` peer 拉取落盘、`:430` state.json（拒写计入 errors 不中断）；`index.js` init 失败兜底日志改经 safe-writer logger。原 `atomicCopy` 删除（无调用方）。 | 安全 7 组 + 六测试全绿（所有既有写行为不变）。 | PASS |
+| S3 安全测试 | 新增 `tests/security.symlink.test.mjs`：7 类真实符号链接攻击——①staging/workspace→storages + 完整双 peer runCycle（哨兵字节、错误含「拒绝写入/符号链接/不再重试」、第二轮 fsp 写系统调用插桩为零）②悬空 storages→proposed（init/config/logs/state 全拒、alias 零创建、`state.json 持久化失败` 可见）③`logs/sync.log`→宿主 workspace.json + 空 token（播种日志/警告零追加、链接保留、无 sync.log.1）④staging workspace.json 本身是文件链接（拒写、不清理链接）⑤悬空 storages 别名直接 mergeWorkspace（Codex 事故复现：merged:false、proposalPathSafe:false）⑥附件落回父级是链接（父目录拒绝、宿主字节不变）⑦真实事故 fixture。HTTP 哨兵改为原始 Buffer 比较（`tests/engine.test.mjs`）。 | 本文件 7 组 ALL PASS；其余五测试保持通过。 | PASS |
+| S4 文档 | README：v1.1.1 说明、「路径边界防护」整节重写为统一 safe-writer 五条规则（边界/祖先链/目标与 O_NOFOLLOW/round 拒绝缓存/落回禁点）、修正「宿主缺失即中止」（实际：缺失时按既有建议/远端合并）、测试表新增 security.symlink。FIX-REPORT：本章节 + v4 更正。`package.json` 1.1.1。 | 文档核对。 | 完成 |
+
+## 验收命令与结果（实测）
+
+`node --check`：`index.js` + 改动的 9 个 `lib/*.js`（safe-writer/util/config/log/store/export/workspace/apply/engine）+ 改动的 2 个 `tests/*.mjs`（engine/security.symlink）= 12 个文件，全部 exit 0。
+
+| 命令 | 结果 |
+|---|---|
+| `node tests/workspace.compat.test.mjs` | exit 0，15 组 ALL PASS（含 3 组真实符号链接攻击，round 独立可重试语义兼容） |
+| `node tests/apply.compat.test.mjs` | exit 0，ALL PASS（projcache 合法落回 `storages/session_projcache/` 经 assertApplyTarget 放行） |
+| `node tests/engine.offline.test.mjs` | exit 0，ALL PASS |
+| `node tests/fixture.accept.test.mjs` | exit 0，ALL PASS |
+| `node tests/engine.test.mjs` | exit 0，ALL PASS（HTTP 哨兵改为原始 Buffer 比较） |
+| `node tests/security.symlink.test.mjs` | exit 0，7 组 ALL PASS |
+
+写入自检（grep，`lib/` 与 `index.js`，实测）：
+
+- 写调用点收敛：`writeFile/rename/copyFile/appendFile/createWriteStream/写模式 open/rm/unlink` 在 safe-writer.js 之外仅命中 `lib/limits.js:14 fsp.open(file, 'r')`（只读）；目录创建（`ensureDir` 的 mkdir）不写内容，且其后内容写入均经 guardedWrite 的祖先链校验；
+- `storages/workspace.json` 无写/删/rename/copy：仅 `lib/export.js:106`、`lib/workspace.js:437` 两处只读 `readWorkspaceStatus`，其余命中为 safe-writer 的拒绝判定与注释；
+- domain 写调用：仅 `index.js:9` 一行说明注释，代码零命中。
+
+## 遗留风险
+
+1. **TOCTOU 边界（如实声明）**：`lstat` 祖先链校验、目标校验与最终 `rename` 之间存在理论竞态窗口——攻击者若能在校验通过后、rename 落盘前的瞬间替换中间目录或目标，防护可能被绕过。缓解：临时文件 `O_NOFOLLOW|O_EXCL`、rename 目标非链接语义、写后 `lstat`+`realpath` 复核可**检测**父目录被替换并报错（已写入内容需人工处理），但不承诺零窗口；彻底消除需 openat2/RESOLVE_BENEATH 级内核支持，Node 无该 API。
+2. storages 边界的判定基于 `lstat(<dshHome>/storages)` 与 root 级校验；init 之后 storages 才被替换为符号链接的场景由逐次写入的 storagesDangerous 检查兜底，但两次检查之间仍有窗口。
+3. `tests/engine.test.mjs` 依赖环境放行本机端口监听；换环境重跑前不能视为永久通过。
+4. 无原生 zstd 解压能力的 Node（如 20.x）会话自动落回保守拒绝（推送/拉取到 staging 不受影响）；需 Node ≥ 22.15/23.8+。
+5. proposal 依赖宿主事务 API 或人工应用；`rejectedTargets` 为进程内 WeakMap，重启后同轮语义重置（属预期，round 本就以 cycle 为界）。
+6. 「交 Codex 第五轮审核」尚未执行，送审前待 PM 安排。
