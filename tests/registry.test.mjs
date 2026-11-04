@@ -13,6 +13,8 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createEngine } from '../lib/engine.js'
+import { normalizeRemapRules, mapPathOnce, isSafeAbsolutePath } from '../lib/workspace.js'
+import { mergeWorkspaces } from '../lib/workspace.js'
 import { applyRegistryIndex, registryServicesUsable } from '../lib/registry-apply.js'
 import { apply as applyPlugin } from '../index.js'
 import { sha1 } from '../lib/util.js'
@@ -798,6 +800,149 @@ try {
     assert.equal(state.archived.has('sa'), true, '归档集合只加不减')
     assert.equal(state.pinned.has('sp'), true, '置顶集合只加不减')
     console.log('场景12 v1.2.2 带 archived/pinned 的重复轮幂等（宿主 no-op 语义） PASS')
+  }
+
+  // ---- v1.3.0：映射只在 registry applier 使用路径时做一次（合并阶段不映射） ----
+  {
+    const quiet = { info: async () => {}, warn: async () => {}, error: async () => {} }
+    const rawPath = 'C:\\Users\\peer\\Documents\\deepseek-harness\\default-workspace'
+    const mappedPath = '/home/user/Documents/deepseek-harness/default-workspace'
+    const state = {
+      byPath: new Map([[mappedPath, { id: 'w1', path: mappedPath, title: 't', sessionIds: [] }]]),
+      sessions: new Set(['s1', 's2']),
+      archived: new Set(),
+      pinned: new Set(),
+    }
+    const registry = mockRegistry(state)
+    const persistence = mockSessionPersistence(state.sessions)
+    const d = doc({ w1: { path: rawPath, title: 't', sessionIds: ['s1', 's2'], createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' } })
+    const remap = [{ from: 'C:\\Users\\peer', to: '/home/user' }]
+    const first = await applyRegistryIndex({ registry, sessionPersistence: persistence, doc: d, pathRemap: remap, log: quiet })
+    assert.equal(first.error, null)
+    assert.deepEqual(registry.calls.resolveByPath, [mappedPath], 'resolveByPath 收到映射后的本机路径')
+    assert.deepEqual(registry.calls.attach.sort(), [mappedPath + '#s1', mappedPath + '#s2'].sort(), '两个会话 attach')
+    // 第二轮（同一原始 doc 再次应用）：映射结果稳定，无重复路径增长
+    const second = await applyRegistryIndex({ registry, sessionPersistence: persistence, doc: d, pathRemap: remap, log: quiet })
+    assert.deepEqual(registry.calls.resolveByPath, [mappedPath, mappedPath], '每轮映射结果一致，无重复后缀')
+    assert.equal(second.registryApplied.sessions, 0, '第二轮不重复 attach')
+    console.log('v1.3.0 映射只在 applier 应用一次（两轮稳定） PASS')
+
+    // 合并阶段保留原始路径（不映射）
+    const merged = mergeWorkspaces(doc({}), d, remap)
+    assert.equal(merged.tables.workspaces.w1.path, rawPath, '合并阶段不做映射，派生文档保留原始路径')
+    console.log('v1.3.0 合并阶段不映射 PASS')
+
+    // 非法规则：整组禁用 + 零 mutation
+    const state2 = { byPath: new Map(), sessions: new Set(['s1']), archived: new Set(), pinned: new Set() }
+    const reg2 = mockRegistry(state2)
+    const bad = await applyRegistryIndex({ registry: reg2, sessionPersistence: mockSessionPersistence(state2.sessions), doc: d, pathRemap: [{ from: 'relative/path', to: '/home/user' }], log: quiet })
+    assert.equal(reg2.calls.create.length, 0, '非法规则 → 零 create')
+    assert.equal(reg2.calls.attach.length, 0, '非法规则 → 零 attach')
+    assert.ok(bad.registryWarnings.length > 0, '非法规则产生可见 warning')
+    console.log('v1.3.0 非法映射规则整组禁用（零 mutation） PASS')
+
+    // 链式规则：单次应用、确定性（不再是增长）
+    const state3 = { byPath: new Map(), sessions: new Set(), archived: new Set(), pinned: new Set() }
+    const reg3 = mockRegistry(state3)
+    const srcRoot = path.join(home, 'proj', 'src')
+    const midRoot = path.join(home, 'proj', 'local')
+    const dstRoot = path.join(home, 'proj', 'archive')
+    await fsp.mkdir(path.join(dstRoot, 'alpha'), { recursive: true })
+    const chain = [{ from: srcRoot, to: midRoot }, { from: midRoot, to: dstRoot }]
+    const d3 = doc({ w2: { path: path.join(srcRoot, 'alpha'), title: 't', sessionIds: [], createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' } })
+    await applyRegistryIndex({ registry: reg3, sessionPersistence: mockSessionPersistence(new Set()), doc: d3, pathRemap: chain, log: quiet })
+    await applyRegistryIndex({ registry: reg3, sessionPersistence: mockSessionPersistence(new Set()), doc: d3, pathRemap: chain, log: quiet })
+    const wantMapped = path.join(dstRoot, 'alpha')
+    assert.deepEqual(reg3.calls.resolveByPath, [wantMapped, wantMapped], '链式规则单次应用、两轮结果稳定')
+    console.log('v1.3.0 链式规则单次应用稳定 PASS')
+  }
+
+  // ---- v1.3.1：本机条目不再映射（防反馈膨胀）+ 规则/路径严格校验 ----
+  {
+    const quiet = { info: async () => {}, warn: async () => {}, error: async () => {} }
+    // 1) 反馈循环：宿主已持久化的本机路径（真实存在）在三轮里都不得被再次映射
+    const localDir = path.join(home, 'fb', 'a', 'local')
+    await fsp.mkdir(localDir, { recursive: true })
+    const seen = []
+    const registry = {
+      async resolveByPath(p) { seen.push(p); return { sessionIds: [], async attachSession() {} } },
+      async create(p) { seen.push('create:' + p); return { sessionIds: [], async attachSession() {} } },
+      async list() { return [] }, async archiveSession() {}, async pinSession() {},
+    }
+    const sp = { async stat() { return { header: {} } } }
+    const d = doc({ w1: { path: localDir, title: 'local', sessionIds: [], createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' } })
+    const remap = [{ from: path.join(home, 'fb', 'a'), to: path.join(home, 'fb', 'a', 'local') }]
+    for (let i = 0; i < 3; i++) await applyRegistryIndex({ registry, sessionPersistence: sp, doc: d, pathRemap: remap, log: quiet })
+    assert.deepEqual(seen, [localDir, localDir, localDir], '本机已存在路径三轮都不映射（无 local/local 膨胀）')
+    console.log('v1.3.1 反馈循环：本机路径不映射 PASS')
+
+    // 2) 非法规则：archive/pin 也必须是零 mutation
+    const st2 = emptyState()
+    st2.sessions = new Set(['sa', 'sp'])
+    const reg2 = mockRegistry(st2)
+    const out2 = await applyRegistryIndex({ registry: reg2, sessionPersistence: mockSessionPersistence(st2.sessions), doc: doc({}, { archivedSessionIds: ['sa'], pinnedSessionIds: ['sp'] }), pathRemap: [{ from: 'relative', to: '/dest' }], log: quiet })
+    assert.equal(reg2.calls.archive.length, 0, '非法规则 → 零 archive')
+    assert.equal(reg2.calls.pin.length, 0, '非法规则 → 零 pin')
+    assert.ok(out2.error && out2.error.includes('pathRemap'), '非法规则错误可见')
+    console.log('v1.3.1 非法规则先于 archive/pin 拒绝（零 mutation） PASS')
+
+    // 3) 空规则下非法 path（"."）也必须零 mutation
+    const st3 = emptyState(); const reg3 = mockRegistry(st3)
+    const out3 = await applyRegistryIndex({ registry: reg3, sessionPersistence: mockSessionPersistence(st3.sessions), doc: doc({ w1: { path: '.', title: 't', sessionIds: ['s1'], createdAt: 'x', updatedAt: 'x' } }), pathRemap: [], log: quiet })
+    assert.equal(reg3.calls.resolveByPath.length + reg3.calls.create.length + reg3.calls.attach.length, 0, '非法 path 零 mutation')
+    assert.ok(out3.registryWarnings.some((w) => w.includes('不合法')), '非法 path warning 可见')
+    console.log('v1.3.1 非法 path（.）零 mutation PASS')
+
+    // 4) UNC 规则被拒绝；盘符大小写不敏感
+    const unc = normalizeRemapRules([{ from: '\\\\server\\share', to: '/dest' }])
+    assert.ok(unc.errors.length > 0, 'UNC 规则被拒绝')
+    const ciDir = path.join(home, 'ci', 'local', 'p')
+    await fsp.mkdir(ciDir, { recursive: true })
+    const st4 = emptyState(); const reg4 = mockRegistry(st4)
+    await applyRegistryIndex({ registry: reg4, sessionPersistence: mockSessionPersistence(new Set()), doc: doc({ w2: { path: 'c:/Users/A/p', title: 't', sessionIds: [], createdAt: 'x', updatedAt: 'x' } }), pathRemap: [{ from: 'C:/Users/A', to: path.join(home, 'ci', 'local') }], log: quiet })
+    assert.deepEqual(reg4.calls.resolveByPath, [ciDir], '盘符大小写不敏感匹配')
+    console.log('v1.3.1 UNC 拒绝 + 盘符大小写不敏感 PASS')
+  }
+
+  // ---- v1.3.2：根路径拒绝、混合分隔符、stat 故障不当作“不存在” ----
+  {
+    const quiet = { info: async () => {}, warn: async () => {}, error: async () => {} }
+    // 1) 根路径规则被拒绝
+    const roots = normalizeRemapRules([{ from: '/', to: '/mapped' }])
+    assert.ok(roots.errors.length > 0, 'from=/ 被拒绝')
+    const roots2 = normalizeRemapRules([{ from: '/source', to: '/' }])
+    assert.ok(roots2.errors.length > 0, 'to=/ 被拒绝')
+    const roots3 = normalizeRemapRules([{ from: 'C:/', to: '/dest' }])
+    assert.ok(roots3.errors.length > 0, 'from=C:/ 被拒绝')
+    console.log('v1.3.2 根路径规则拒绝 PASS')
+
+    // 2) 混合分隔符/UNC：POSIX 路径含反斜杠 → 不合法；映射结果复验
+    assert.equal(isSafeAbsolutePath('/source/..\\outside'), false, 'POSIX 含反斜杠判为不合法')
+    assert.equal(isSafeAbsolutePath('/\\server\\share'), false, '混合 UNC 判为不合法')
+    const mappedBad = mapPathOnce('/source/..\\outside', [{ from: '/source', to: '/dest' }])
+    assert.ok(mappedBad.errors.length > 0, '映射结果复验拒绝')
+    console.log('v1.3.2 混合分隔符/UNC 拒绝 PASS')
+
+    // 3) stat EIO 不当作不存在（不得回退到映射目标）
+    const targetDir = path.join(home, 'v132', 'target')
+    await fsp.mkdir(targetDir, { recursive: true })
+    const st = emptyState()
+    const reg = mockRegistry(st)
+    const eio = new Error('io error'); eio.code = 'EIO'
+    const out = await applyRegistryIndex({
+      registry: reg,
+      sessionPersistence: mockSessionPersistence(st.sessions),
+      doc: doc({ w1: { path: '/source', title: 't', sessionIds: ['s1'], createdAt: 'x', updatedAt: 'x' } }),
+      pathRemap: [{ from: '/source', to: targetDir }],
+      statFn: async (p) => {
+        if (p === '/source') throw eio
+        return { isDirectory: () => true }
+      },
+      log: quiet,
+    })
+    assert.equal(reg.calls.create.length + reg.calls.attach.length, 0, 'stat EIO 不得继续 create/attach')
+    assert.ok(out.registryWarnings.some((w) => w.includes('EIO')), 'EIO warning 可见')
+    console.log('v1.3.2 stat EIO 不当作不存在 PASS')
   }
 
   console.log('ALL PASS（registry.test.mjs：R1-R5 + v1.2.2 覆盖，12 组场景）')
