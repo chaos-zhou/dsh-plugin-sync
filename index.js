@@ -6,28 +6,24 @@ import { createLogger } from './lib/log.js'
 export const inject = ['tools']
 
 export function apply(ctx, config) {
-  // v1.1 起插件不写宿主工作区索引；v1.2 可选注入宿主 workspaceRegistry/sessionPersistence，
-  // 服务可用时经宿主事务 API 自动应用索引（registry 模式），否则回退 proposal 模式。
-  // 拿不到（宿主无 inject/服务缺失/抛错）一律解析为 null，绝不抛出。
-  const services = (async () => {
-    try {
-      if (typeof ctx?.inject !== 'function') return null
-      let callbackArgs = null
-      const collect = (...args) => { callbackArgs = args.length === 1 ? args[0] : args }
-      const out = await ctx.inject(['workspaceRegistry', 'sessionPersistence'], collect)
-      for (const value of [out, callbackArgs]) {
-        if (Array.isArray(value)) return { workspaceRegistry: value[0], sessionPersistence: value[1] }
-        if (value && typeof value === 'object') {
-          return { workspaceRegistry: value.workspaceRegistry ?? null, sessionPersistence: value.sessionPersistence ?? null }
-        }
-      }
-      return null
-    } catch {
-      return null
+  const engine = createEngine({ rowConfig: config || {} })
+  // v1.1 起插件不写宿主工作区索引；v1.2 起可选经宿主 workspaceRegistry/sessionPersistence
+  // 事务 API 自动应用（registry 模式），服务不可用回退 proposal 模式。
+  // v1.2.1 修正注入契约（BLOCKER 1）：Cordis 的 ctx.inject(deps, cb) 回调签名是
+  // (injectCtx, config)，服务必须从回调参数（注入后的 Context）读取——此前把回调参数当
+  // 服务数组解析，服务齐全也永远降级 proposal。回调返回的函数由宿主用作卸载清理，
+  // 清理即 setServices(null) 立即回退 proposal。宿主无 inject/注入抛错保持 proposal，
+  // 绝不向上抛。
+  try {
+    if (typeof ctx?.inject === 'function') {
+      ctx.inject(['workspaceRegistry', 'sessionPersistence'], (injectCtx) => {
+        engine.setServices(injectCtx && typeof injectCtx === 'object' ? injectCtx : null)
+        return () => engine.setServices(null)
+      })
     }
-  })()
-
-  const engine = createEngine({ rowConfig: config || {}, services })
+  } catch {
+    engine.setServices(null)
+  }
   const ready = engine.init().catch((e) => {
     // 不能抛到宿主：兜底日志经 safe-writer 的 logger（目标为符号链接时安全拒绝）
     if (engine.dataDir) {

@@ -1,11 +1,17 @@
-// v1.2 registry applier 测试：纯 mock 宿主 workspaceRegistry/sessionPersistence，
-// 不碰真实宿主与真实 ~/.dsh。覆盖 FEATURE-SPEC v1.2 的 8 类场景 + engine/index 接入。
+// v1.2.1 registry applier 测试：纯 mock 宿主 workspaceRegistry/sessionPersistence，
+// 不碰真实宿主与真实 ~/.dsh。覆盖 FIX-SPEC v1.2.1 R1-R5：
+// R1 注入回调契约 (injectCtx, config) 与服务可用性校验（缺方法/空对象 → proposal）；
+// R2 既有 workspace 零 setTitle（标题只在 create 新建时传入）；
+// R3 坏文档（engine 门禁 + applier 防御自检）零 mutation；
+// R4 路径只映射一次（engine 全链路，pathRemap 的 to 含 from 以暴露二次映射）；
+// R5 逐 API 故障注入（resolveByPath/create/stat/attach/archive/pin 各自断言后续条目继续、
+//    其它 API 调用次数符合预期，不再整体短路）。
 import assert from 'node:assert/strict'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createEngine } from '../lib/engine.js'
-import { applyRegistryIndex } from '../lib/registry-apply.js'
+import { applyRegistryIndex, registryServicesUsable } from '../lib/registry-apply.js'
 import { apply as applyPlugin } from '../index.js'
 
 const tmpRoot = fileURLToPath(new URL('./.tmp/', import.meta.url))
@@ -19,8 +25,10 @@ const activeSessionError = () => {
 }
 
 // state.byPath: Map<canonicalPath, {id, path, title, sessionIds}>；state.sessions: Set（宿主已识别）
+// opts.throwXxx 支持 true 或 (arg) => boolean，用于逐 API 精确注入故障。
 function mockRegistry(state, opts = {}) {
-  const calls = { create: [], resolveByPath: [], attach: [], archive: [], pin: [], setTitle: [], unarchive: [], unpin: [] }
+  const calls = { create: [], createTitles: [], resolveByPath: [], attach: [], archive: [], pin: [], setTitle: [], unarchive: [], unpin: [] }
+  const shouldThrow = (spec, arg) => spec === true || (typeof spec === 'function' && spec(arg))
   let nextId = 1
   const makeWs = (ws) => ({
     id: ws.id,
@@ -29,7 +37,6 @@ function mockRegistry(state, opts = {}) {
     sessionIds: ws.sessionIds,
     async setTitle(title) {
       calls.setTitle.push(ws.path)
-      if (opts.throwSetTitle) throw new Error('setTitle failed')
       ws.title = title
     },
     async attachSession(sid) {
@@ -44,7 +51,8 @@ function mockRegistry(state, opts = {}) {
     state,
     async create(p, title) {
       calls.create.push(p)
-      if (opts.throwCreate) throw new Error('create failed')
+      calls.createTitles.push(title === undefined ? null : title)
+      if (shouldThrow(opts.throwCreate, p)) throw new Error('create failed')
       const found = state.byPath.get(p)
       if (found) return makeWs(found)
       const ws = { id: `ws-${nextId++}`, path: p, title: typeof title === 'string' && title.length > 0 ? title : path.basename(p), sessionIds: [] }
@@ -53,13 +61,14 @@ function mockRegistry(state, opts = {}) {
     },
     async resolveByPath(p) {
       calls.resolveByPath.push(p)
-      if (opts.throwResolve) throw new Error('resolve failed')
+      if (shouldThrow(opts.throwResolve, p)) throw new Error('resolve failed')
       const found = state.byPath.get(p)
       return found ? makeWs(found) : undefined
     },
     list() { return [...state.byPath.values()].map(makeWs) },
     async archiveSession(id) {
       calls.archive.push(id)
+      if (shouldThrow(opts.throwArchive, id)) throw new Error('archive failed')
       if (state.activeSessions.has(id)) throw activeSessionError()
       if (!state.sessions.has(id)) throw new Error('session not found')
       state.archived.add(id)
@@ -67,6 +76,7 @@ function mockRegistry(state, opts = {}) {
     async unarchiveSession(id) { calls.unarchive.push(id) },
     async pinSession(id) {
       calls.pin.push(id)
+      if (shouldThrow(opts.throwPin, id)) throw new Error('pin failed')
       if (state.archived.has(id) || !state.sessions.has(id)) throw new Error('cannot pin archived or missing session')
       state.pinned.add(id)
     },
@@ -86,6 +96,8 @@ function mockSessionPersistence(knownIds, opts = {}) {
     async list() { return [...knownIds].map((id) => ({ id })) },
   }
 }
+
+const emptyState = () => ({ byPath: new Map(), sessions: new Set(), activeSessions: new Set(), archived: new Set(), pinned: new Set() })
 
 const wsEntry = (dir, title, sessionIds) => ({
   path: dir, title, sessionIds, createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-02T00:00:00Z',
@@ -113,99 +125,111 @@ async function writeStaging(stagingRoot, value) {
   await fsp.writeFile(file, JSON.stringify(value))
 }
 
+// 模拟宿主自身的 storages/workspace.json（插件对它只读）
+async function writeHostWorkspace(dshHome, value) {
+  const file = path.join(dshHome, 'storages', 'workspace.json')
+  await fsp.mkdir(path.dirname(file), { recursive: true })
+  await fsp.writeFile(file, JSON.stringify(value))
+}
+
 async function freshDir(name) {
   const dir = path.join(home, name)
   await fsp.mkdir(dir, { recursive: true })
   return dir
 }
 
-const result = { registryApplied: null, registryWarnings: [], error: null }
+const zeroMutationCalls = (registry, sp, label) => {
+  assert.deepEqual(registry.calls.resolveByPath, [], `${label}：零 resolveByPath`)
+  assert.deepEqual(registry.calls.create, [], `${label}：零 create`)
+  assert.deepEqual(registry.calls.attach, [], `${label}：零 attach`)
+  assert.deepEqual(registry.calls.archive, [], `${label}：零 archive`)
+  assert.deepEqual(registry.calls.pin, [], `${label}：零 pin`)
+  assert.deepEqual(registry.calls.setTitle, [], `${label}：零 setTitle`)
+  assert.deepEqual(sp.statCalls, [], `${label}：连 stat 都不调用`)
+}
 
 try {
-  // ---------- 场景 1：resolveByPath 命中/未命中 → create 只在未命中时调用；attach 只对本地缺失 ----------
+  // ---------- 场景 1：applier 直连正常路径 + R2 标题策略 ----------
+  // 既有 workspace：本地标题==目录 basename 且远端不同（旧实现会 setTitle，新实现必须零调用）；
+  // 新建 workspace：create 收到远端 title。
   {
-    const stagingRoot = await freshDir('s1-staging')
     const alpha = await freshDir('s1/projects/alpha')
     const beta = await freshDir('s1/projects/beta')
     const state = {
-      byPath: new Map([[alpha, { id: 'ws-a', path: alpha, title: 'Alpha', sessionIds: ['s1'] }]]),
+      byPath: new Map([[alpha, { id: 'ws-a', path: alpha, title: 'alpha', sessionIds: ['s1'] }]]),
       sessions: new Set(['s1', 's2', 's3']),
-      activeSessions: new Set(),
-      archived: new Set(),
-      pinned: new Set(),
+      activeSessions: new Set(), archived: new Set(), pinned: new Set(),
     }
     const registry = mockRegistry(state)
     const sp = mockSessionPersistence(state.sessions)
-    await writeStaging(stagingRoot, doc({
-      [alpha]: wsEntry(alpha, 'Alpha', ['s1', 's2']),
+    const out = await applyRegistryIndex({ registry, sessionPersistence: sp, doc: doc({
+      [alpha]: wsEntry(alpha, 'Alpha-远端', ['s1', 's2']),
       [beta]: wsEntry(beta, 'Beta', ['s3']),
-    }))
-    const out = await applyRegistryIndex({ registry, sessionPersistence: sp, stagingRoot })
+    }) })
     assert.equal(out.error, null)
     assert.deepEqual(registry.calls.create, [beta], 'create 只在未命中时调用一次')
+    assert.deepEqual(registry.calls.createTitles, ['Beta'], 'R2：新建时 create 收到远端 title')
     assert.deepEqual(registry.calls.resolveByPath, [alpha, beta])
     assert.deepEqual(registry.calls.attach.sort(), [`${alpha}#s2`, `${beta}#s3`].sort(), 'attach 只对本地缺失的会话')
-    assert.deepEqual(registry.calls.setTitle, [], 'create 已带远端标题，不再 setTitle')
+    assert.deepEqual(registry.calls.setTitle, [], 'R2：既有 workspace 零 setTitle（本地标题==basename 且远端不同也不改）')
+    assert.equal(state.byPath.get(alpha).title, 'alpha', '既有标题不被远端覆盖（重命名不跨设备同步）')
+    assert.equal(state.byPath.get(beta).title, 'Beta')
     assert.deepEqual(sp.statCalls.sort(), ['s2', 's3'], '已存在的会话不查 stat')
-    assert.equal(out.registryApplied.workspaces, 2)
-    assert.equal(out.registryApplied.created, 1)
-    assert.equal(out.registryApplied.sessions, 2)
+    assert.deepEqual(out.registryApplied, { workspaces: 2, created: 1, sessions: 2, archived: 0, pinned: 0 })
     assert.deepEqual(out.registryWarnings, [])
     assert.deepEqual(state.byPath.get(alpha).sessionIds, ['s1', 's2'])
     assert.deepEqual(state.byPath.get(beta).sessionIds, ['s3'])
-    assert.equal(state.byPath.get(beta).title, 'Beta')
-    result.registryApplied = out.registryApplied
-    console.log('场景1 命中/未命中 create 仅未命中一次、attach 仅缺失会话 PASS')
+    console.log('场景1 正常路径 + R2 标题（既有零 setTitle / create 带 title） PASS')
   }
 
   // ---------- 场景 2：幂等——全部已存在时零 create/attach/setTitle ----------
   {
-    const stagingRoot = await freshDir('s2-staging')
     const alpha = await freshDir('s2/projects/alpha')
     const state = {
-      byPath: new Map([[alpha, { id: 'ws-a', path: alpha, title: 'Alpha', sessionIds: ['s1', 's2'] }]]),
+      byPath: new Map([[alpha, { id: 'ws-a', path: alpha, title: 'alpha', sessionIds: ['s1', 's2'] }]]),
       sessions: new Set(['s1', 's2']),
       activeSessions: new Set(), archived: new Set(), pinned: new Set(),
     }
     const registry = mockRegistry(state)
     const sp = mockSessionPersistence(state.sessions)
-    await writeStaging(stagingRoot, doc({ [alpha]: wsEntry(alpha, 'Alpha', ['s1', 's2']) }))
-    await applyRegistryIndex({ registry, sessionPersistence: sp, stagingRoot })
+    const docValue = doc({ [alpha]: wsEntry(alpha, 'alpha', ['s1', 's2']) })
+    await applyRegistryIndex({ registry, sessionPersistence: sp, doc: docValue })
     const before = structuredClone(registry.calls)
-    const second = await applyRegistryIndex({ registry, sessionPersistence: sp, stagingRoot })
+    const second = await applyRegistryIndex({ registry, sessionPersistence: sp, doc: docValue })
     assert.deepEqual(registry.calls.create, before.create, '零 create')
     assert.deepEqual(registry.calls.attach, before.attach, '零 attach')
     assert.deepEqual(registry.calls.setTitle, before.setTitle, '零 setTitle')
-    assert.equal(second.registryApplied.created, 0)
-    assert.equal(second.registryApplied.sessions, 0)
-    assert.equal(second.registryApplied.titles, 0)
+    assert.deepEqual(second.registryApplied, { workspaces: 1, created: 0, sessions: 0, archived: 0, pinned: 0 })
     assert.deepEqual(second.registryWarnings, [])
     console.log('场景2 幂等：全部已存在时零 create/attach/setTitle PASS')
   }
 
-  // ---------- 场景 3：sessionPersistence.stat 缺失 → 不 attach，warning 记录 ----------
+  // ---------- 场景 3：R3 applier 防御性自检——坏文档直接返回，不触碰任何 registry API ----------
   {
-    const stagingRoot = await freshDir('s3-staging')
-    const alpha = await freshDir('s3/projects/alpha')
-    const state = {
-      byPath: new Map([[alpha, { id: 'ws-a', path: alpha, title: 'Alpha', sessionIds: ['s1'] }]]),
-      sessions: new Set(['s1']),
-      activeSessions: new Set(), archived: new Set(), pinned: new Set(),
+    const missingUnit = { global: doc({}).global, tables: { workspaces: {} } }
+    const missingInitialized = doc({})
+    delete missingInitialized.global.initialized
+    const badEntry = doc({ '/nowhere/ws': { path: '/nowhere/ws', title: 123, sessionIds: [], createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-02T00:00:00Z' } })
+    const badDocs = [
+      ['缺 unit 信封', missingUnit],
+      ['缺 global.initialized', missingInitialized],
+      ['条目 title 非法', badEntry],
+      ['doc 为 null', null],
+    ]
+    for (const [label, bad] of badDocs) {
+      const registry = mockRegistry(emptyState())
+      const sp = mockSessionPersistence(new Set())
+      const out = await applyRegistryIndex({ registry, sessionPersistence: sp, doc: bad })
+      assert.ok(out.error && out.error.includes('零 mutation'), `${label}：错误说明零 mutation`)
+      assert.deepEqual(out.registryApplied, { workspaces: 0, created: 0, sessions: 0, archived: 0, pinned: 0 }, `${label}：计数全零`)
+      assert.deepEqual(out.registryWarnings, [], `${label}：零 warning`)
+      zeroMutationCalls(registry, sp, label)
     }
-    const registry = mockRegistry(state)
-    const sp = mockSessionPersistence(state.sessions)
-    await writeStaging(stagingRoot, doc({ [alpha]: wsEntry(alpha, 'Alpha', ['s1', 'ghost-sid']) }))
-    const out = await applyRegistryIndex({ registry, sessionPersistence: sp, stagingRoot })
-    assert.deepEqual(registry.calls.attach, [], '宿主未识别的会话不 attach')
-    assert.equal(out.registryApplied.sessions, 0)
-    assert.ok(out.registryWarnings.some((w) => w.includes('ghost-sid') && w.includes('未被宿主识别')), 'warning 记录缺失会话')
-    assert.equal(out.error, null)
-    console.log('场景3 stat 缺失会话跳过并记 warning PASS')
+    console.log('场景3 R3 applier 防御自检：4 类坏文档零 mutation PASS')
   }
 
   // ---------- 场景 4：本地目录不存在 / 不是目录 → 跳过整个 workspace，不 create、不 attach ----------
   {
-    const stagingRoot = await freshDir('s4-staging')
     const alpha = await freshDir('s4/projects/alpha')
     const ghost = path.join(home, 's4/projects/ghost')
     const notDir = path.join(home, 's4/plain-file')
@@ -213,12 +237,11 @@ try {
     const state = { byPath: new Map(), sessions: new Set(['s1', 's9']), activeSessions: new Set(), archived: new Set(), pinned: new Set() }
     const registry = mockRegistry(state)
     const sp = mockSessionPersistence(state.sessions)
-    await writeStaging(stagingRoot, doc({
+    const out = await applyRegistryIndex({ registry, sessionPersistence: sp, doc: doc({
       [alpha]: wsEntry(alpha, 'Alpha', ['s1']),
       [ghost]: wsEntry(ghost, 'Ghost', ['s9']),
       [notDir]: wsEntry(notDir, 'NotDir', ['s9']),
-    }))
-    const out = await applyRegistryIndex({ registry, sessionPersistence: sp, stagingRoot })
+    }) })
     assert.deepEqual(registry.calls.create, [alpha], '只有真实目录被 create')
     assert.deepEqual(registry.calls.attach, [`${alpha}#s1`], '缺失目录的会话全部不处理')
     assert.ok(out.registryWarnings.some((w) => w.includes('ghost') && w.includes('不存在')))
@@ -230,10 +253,9 @@ try {
 
   // ---------- 场景 5：archive/pin 只加不减；active 归档抛错 → warning 不中断；未识别跳过 ----------
   {
-    const stagingRoot = await freshDir('s5-staging')
     const alpha = await freshDir('s5/projects/alpha')
     const state = {
-      byPath: new Map([[alpha, { id: 'ws-a', path: alpha, title: 'Alpha', sessionIds: [] }]]),
+      byPath: new Map([[alpha, { id: 'ws-a', path: alpha, title: 'alpha', sessionIds: [] }]]),
       sessions: new Set(['sa', 'sActive', 'sp', 'sArchived']),
       activeSessions: new Set(['sActive']),
       archived: new Set(['sArchived']),
@@ -241,13 +263,12 @@ try {
     }
     const registry = mockRegistry(state)
     const sp = mockSessionPersistence(state.sessions)
-    await writeStaging(stagingRoot, doc({
-      [alpha]: wsEntry(alpha, 'Alpha', []),
+    const out = await applyRegistryIndex({ registry, sessionPersistence: sp, doc: doc({
+      [alpha]: wsEntry(alpha, 'alpha', []),
     }, {
       archivedSessionIds: ['sa', 'sActive', 'sMissing'],
       pinnedSessionIds: ['sp', 'sArchived'],
-    }))
-    const out = await applyRegistryIndex({ registry, sessionPersistence: sp, stagingRoot })
+    }) })
     assert.deepEqual(registry.calls.archive.sort(), ['sActive', 'sa'].sort(), '只对宿主已识别会话尝试归档（只加）')
     assert.deepEqual(registry.calls.unarchive, [], '从不 unarchive（只加不减）')
     assert.deepEqual(registry.calls.unpin, [], '从不 unpin')
@@ -263,126 +284,330 @@ try {
     console.log('场景5 archive/pin 只加不减、active 抛错 warning 不中断 PASS')
   }
 
-  // ---------- 场景 6：标题规则——本地 title==basename 且远端不同才跟随；已改名不覆盖；同名不调用 ----------
+  // ---------- 场景 6：R5 逐 API 故障注入（每例断言 warning、后续条目继续、其它 API 次数） ----------
   {
-    const stagingRoot = await freshDir('s6-staging')
-    const gamma = await freshDir('s6/projects/gamma')
-    const delta = await freshDir('s6/projects/delta')
-    const eps = await freshDir('s6/projects/eps')
-    const state = {
-      byPath: new Map([
-        [gamma, { id: 'ws-g', path: gamma, title: 'gamma', sessionIds: [] }],
-        [delta, { id: 'ws-d', path: delta, title: 'My Custom', sessionIds: [] }],
-        [eps, { id: 'ws-e', path: eps, title: 'Epsilon', sessionIds: [] }],
-      ]),
-      sessions: new Set(), activeSessions: new Set(), archived: new Set(), pinned: new Set(),
+    // 6a resolveByPath 对第一个 workspace 抛错 → 该条跳过，第二个 workspace 完整处理
+    {
+      const alpha = await freshDir('s6a/projects/alpha')
+      const beta = await freshDir('s6a/projects/beta')
+      const registry = mockRegistry(emptyState(), { throwResolve: (p) => p === alpha })
+      const sp = mockSessionPersistence(new Set(['s1', 's2']))
+      const out = await applyRegistryIndex({ registry, sessionPersistence: sp, doc: doc({
+        [alpha]: wsEntry(alpha, 'Alpha', ['s1']),
+        [beta]: wsEntry(beta, 'Beta', ['s2']),
+      }) })
+      assert.equal(out.error, null)
+      assert.ok(out.registryWarnings.some((w) => w.includes(alpha) && w.includes('resolve failed')), 'resolve 错误进 warning')
+      assert.deepEqual(registry.calls.resolveByPath, [alpha, beta], '后续条目继续 resolve')
+      assert.deepEqual(registry.calls.create, [beta], '后续条目继续 create')
+      assert.deepEqual(registry.calls.attach, [`${beta}#s2`], '故障条目零 attach，其它条目正常 attach')
+      assert.deepEqual(out.registryApplied, { workspaces: 1, created: 1, sessions: 1, archived: 0, pinned: 0 })
     }
-    const registry = mockRegistry(state)
-    const sp = mockSessionPersistence(state.sessions)
-    await writeStaging(stagingRoot, doc({
-      [gamma]: wsEntry(gamma, 'Gamma 远端', []),
-      [delta]: wsEntry(delta, 'Delta 远端', []),
-      [eps]: wsEntry(eps, 'Epsilon', []),
-    }))
-    const out = await applyRegistryIndex({ registry, sessionPersistence: sp, stagingRoot })
-    assert.deepEqual(registry.calls.setTitle, [gamma], '只在本地标题==目录 basename 且远端不同时 setTitle')
-    assert.equal(state.byPath.get(gamma).title, 'Gamma 远端')
-    assert.equal(state.byPath.get(delta).title, 'My Custom', '本地已改名不被远端覆盖')
-    assert.equal(state.byPath.get(eps).title, 'Epsilon', '两端同名不调用')
-    assert.equal(out.registryApplied.titles, 1)
-    // 跟随之后下一轮不再改（单调收敛）
-    await applyRegistryIndex({ registry, sessionPersistence: sp, stagingRoot })
-    assert.deepEqual(registry.calls.setTitle, [gamma], 'setTitle 单调，不震荡')
-    console.log('场景6 标题规则（跟随/不覆盖/同名/单调） PASS')
+    // 6b create 抛错 → 两条都失败，但第二条仍被尝试（不被首条短路），attach 均不发生
+    {
+      const alpha = await freshDir('s6b/projects/alpha')
+      const beta = await freshDir('s6b/projects/beta')
+      const registry = mockRegistry(emptyState(), { throwCreate: true })
+      const sp = mockSessionPersistence(new Set(['s1', 's2']))
+      const out = await applyRegistryIndex({ registry, sessionPersistence: sp, doc: doc({
+        [alpha]: wsEntry(alpha, 'Alpha', ['s1']),
+        [beta]: wsEntry(beta, 'Beta', ['s2']),
+      }) })
+      assert.equal(out.error, null)
+      assert.equal(out.registryWarnings.filter((w) => w.includes('create failed')).length, 2, '两条 create 失败都有 warning')
+      assert.deepEqual(registry.calls.resolveByPath, [alpha, beta], '后续条目继续 resolve')
+      assert.deepEqual(registry.calls.create, [alpha, beta], '后续条目继续尝试 create')
+      assert.deepEqual(registry.calls.attach, [], 'create 失败的条目零 attach')
+    }
+    // 6c stat 抛错 → archive/pin/attach 全部跳过并各有一条 warning，但 workspace 级 create 不受影响
+    {
+      const alpha = await freshDir('s6c/projects/alpha')
+      const registry = mockRegistry(emptyState())
+      const sp = mockSessionPersistence(new Set(['sa', 'sp', 'sx']), { throwStat: true })
+      const out = await applyRegistryIndex({ registry, sessionPersistence: sp, doc: doc({
+        [alpha]: wsEntry(alpha, 'Alpha', ['sx']),
+      }, { archivedSessionIds: ['sa'], pinnedSessionIds: ['sp'] }) })
+      assert.equal(out.error, null)
+      assert.deepEqual(sp.statCalls, ['sa', 'sp', 'sx'], '三个 id 各尝试一次 stat')
+      assert.deepEqual(registry.calls.archive, [], 'stat 失败不 archive')
+      assert.deepEqual(registry.calls.pin, [], 'stat 失败不 pin')
+      assert.deepEqual(registry.calls.attach, [], 'stat 失败不 attach')
+      assert.deepEqual(registry.calls.create, [alpha], 'workspace 级 create 不被 stat 故障短路')
+      assert.equal(out.registryWarnings.length, 3, '归档/置顶/附加各一条 warning')
+      assert.ok(out.registryWarnings.some((w) => w.includes('sa') && w.includes('归档')))
+      assert.ok(out.registryWarnings.some((w) => w.includes('sp') && w.includes('置顶')))
+      assert.ok(out.registryWarnings.some((w) => w.includes('sx') && w.includes('附加')))
+    }
+    // 6d attachSession 对特定会话抛错 → 同工作区后续会话继续，其它工作区也继续
+    {
+      const alpha = await freshDir('s6d/projects/alpha')
+      const beta = await freshDir('s6d/projects/beta')
+      const state = {
+        byPath: new Map([
+          [alpha, { id: 'ws-a', path: alpha, title: 'alpha', sessionIds: [] }],
+          [beta, { id: 'ws-b', path: beta, title: 'beta', sessionIds: [] }],
+        ]),
+        sessions: new Set(['s1', 's2', 's3']),
+        activeSessions: new Set(), archived: new Set(), pinned: new Set(),
+      }
+      const registry = mockRegistry(state, { throwAttach: 's2' })
+      const sp = mockSessionPersistence(state.sessions)
+      const out = await applyRegistryIndex({ registry, sessionPersistence: sp, doc: doc({
+        [alpha]: wsEntry(alpha, 'alpha', ['s1', 's2']),
+        [beta]: wsEntry(beta, 'beta', ['s3']),
+      }) })
+      assert.equal(out.error, null)
+      assert.deepEqual(registry.calls.attach, [`${alpha}#s1`, `${alpha}#s2`, `${beta}#s3`], 's2 抛错后 s3 与 beta 仍继续')
+      assert.ok(out.registryWarnings.some((w) => w.includes('s2') && w.includes('attach failed')), 'attach 错误进 warning')
+      assert.equal(out.registryApplied.sessions, 2, '仅两条成功')
+      assert.deepEqual(state.byPath.get(alpha).sessionIds, ['s1'], '失败的 s2 未入表')
+      assert.deepEqual(state.byPath.get(beta).sessionIds, ['s3'])
+    }
+    // 6e archiveSession 抛错 → warning；pin 循环与 workspace 处理照常
+    {
+      const alpha = await freshDir('s6e/projects/alpha')
+      const state = { byPath: new Map(), sessions: new Set(['sa', 'sp', 's1']), activeSessions: new Set(), archived: new Set(), pinned: new Set() }
+      const registry = mockRegistry(state, { throwArchive: true })
+      const sp = mockSessionPersistence(state.sessions)
+      const out = await applyRegistryIndex({ registry, sessionPersistence: sp, doc: doc({
+        [alpha]: wsEntry(alpha, 'Alpha', ['s1']),
+      }, { archivedSessionIds: ['sa'], pinnedSessionIds: ['sp'] }) })
+      assert.equal(out.error, null)
+      assert.ok(out.registryWarnings.some((w) => w.includes('sa') && w.includes('archive failed')), 'archive 错误进 warning')
+      assert.deepEqual(registry.calls.archive, ['sa'], 'archive 仍被尝试')
+      assert.deepEqual(registry.calls.pin, ['sp'], '后续 pin 循环继续')
+      assert.deepEqual(registry.calls.create, [alpha], 'workspace 处理继续')
+      assert.deepEqual(registry.calls.attach, [`${alpha}#s1`])
+      assert.equal(out.registryApplied.pinned, 1)
+    }
+    // 6f pinSession 抛错 → warning；workspace 处理照常
+    {
+      const alpha = await freshDir('s6f/projects/alpha')
+      const state = { byPath: new Map(), sessions: new Set(['sp', 's1']), activeSessions: new Set(), archived: new Set(), pinned: new Set() }
+      const registry = mockRegistry(state, { throwPin: true })
+      const sp = mockSessionPersistence(state.sessions)
+      const out = await applyRegistryIndex({ registry, sessionPersistence: sp, doc: doc({
+        [alpha]: wsEntry(alpha, 'Alpha', ['s1']),
+      }, { pinnedSessionIds: ['sp'] }) })
+      assert.equal(out.error, null)
+      assert.ok(out.registryWarnings.some((w) => w.includes('sp') && w.includes('pin failed')), 'pin 错误进 warning')
+      assert.deepEqual(registry.calls.pin, ['sp'], 'pin 仍被尝试')
+      assert.deepEqual(registry.calls.create, [alpha], 'workspace 处理继续')
+      assert.deepEqual(registry.calls.attach, [`${alpha}#s1`])
+    }
+    console.log('场景6 R5 逐 API 故障注入（resolve/create/stat/attach/archive/pin） PASS')
   }
 
-  // ---------- 场景 7：registry 不可用 → 回退 proposal（applier 与 engine 两级验证） ----------
+  // ---------- 场景 7：R4 engine 全链路只映射一次 ----------
+  // pathRemap 故意取 to=from+'/local'（二次映射会产生 /local/local 并触发目录不存在警告）。
   {
-    const stagingRoot = await freshDir('s7-staging')
-    await writeStaging(stagingRoot, doc({ '/x': wsEntry('/x', 'X', []) }))
-    const direct = await applyRegistryIndex({ registry: null, sessionPersistence: null, stagingRoot })
-    assert.equal(direct.error, 'registry 不可用')
-    assert.deepEqual(direct.registryWarnings, [])
-    const half = await applyRegistryIndex({ registry: mockRegistry({ byPath: new Map(), sessions: new Set(), activeSessions: new Set(), archived: new Set(), pinned: new Set() }), sessionPersistence: null, stagingRoot })
-    assert.equal(half.error, 'registry 不可用', '缺 sessionPersistence 同样降级')
-
     const cycleHome = path.join(home, 's7-engine')
+    const remapFrom = path.join(home, 's7/projects')
+    const realDir = await freshDir('s7/projects/local/alpha')
+    const state = emptyState()
+    state.sessions = new Set(['s1'])
+    const registry = mockRegistry(state)
+    const sp = mockSessionPersistence(state.sessions)
     const engine = createEngine({ rowConfig: {
       dshHome: cycleHome, deviceName: 's7', listenPort: 0, token: 't', settleSec: 0,
+      pathRemap: [{ from: remapFrom, to: path.join(remapFrom, 'local') }],
     } })
+    engine.setServices({ workspaceRegistry: registry, sessionPersistence: sp })
     try {
       await engine.init()
       await writeStaging(path.join(cycleHome, 'plugin-sync/staging'), doc({
-        '/nonexistent/path': wsEntry('/nonexistent/path', 'X', []),
+        [path.join(remapFrom, 'alpha')]: wsEntry(path.join(remapFrom, 'alpha'), 'Alpha', ['s1']),
       }))
       const summary = await engine.runCycle()
-      assert.equal(summary.workspaceWriteMode, 'proposal', '无服务回退 proposal')
-      assert.equal(summary.registryAvailable, false)
-      assert.equal(summary.registryApplied, null)
-      assert.equal(summary.proposalPending, true, 'proposal 文件照常生成（v1.1.2 行为）')
-      assert.ok(summary.warnings.some((w) => w.includes('建议')), 'proposal 模式保留待应用提示')
-      const status = await engine.status()
-      assert.equal(status.workspaceWriteMode, 'proposal')
-      assert.equal(status.registryAvailable, false)
-      assert.equal(status.registryLastApplied, null)
-      assert.deepEqual(await fsp.readdir(path.join(cycleHome, 'storages')).catch(() => []), [], '宿主 storages 目录未被创建')
+      assert.equal(summary.workspaceWriteMode, 'registry')
+      assert.deepEqual(registry.calls.resolveByPath, [realDir], 'R4：resolveByPath 收到映射一次后的最终路径')
+      assert.deepEqual(registry.calls.create, [realDir])
+      assert.ok(!registry.calls.resolveByPath.some((p) => p.includes('/local/local')), '无二次映射产物')
+      assert.deepEqual(summary.registryWarnings, [], '二次映射必产生目录不存在警告——零警告佐证只映射一次')
+      assert.equal(summary.registryApplied.workspaces, 1)
+      assert.equal(summary.registryApplied.sessions, 1)
     } finally {
       await engine.close()
     }
-    console.log('场景7 registry 不可用回退 proposal（applier+engine） PASS')
+    console.log('场景7 R4 engine 全链路路径只映射一次 PASS')
   }
 
-  // ---------- 场景 8：所有异常被捕获 → cycle 不 throw、warnings/errors 可见 ----------
+  // ---------- 场景 8：R3 engine 门禁——坏文档零 mutation ----------
   {
-    const stagingRoot = await freshDir('s8-staging')
-    const alpha = await freshDir('s8/projects/alpha')
-    await writeStaging(stagingRoot, doc({ [alpha]: wsEntry(alpha, 'Alpha', ['sx']) }, { archivedSessionIds: ['sa'], pinnedSessionIds: ['sp'] }))
-    const state = { byPath: new Map(), sessions: new Set(['sa', 'sp', 'sx']), activeSessions: new Set(), archived: new Set(), pinned: new Set() }
-    const registry = mockRegistry(state, { throwResolve: true, throwCreate: true, throwAttach: 'sx', throwSetTitle: true })
-    const sp = mockSessionPersistence(state.sessions, { throwStat: true })
-    const out = await applyRegistryIndex({ registry, sessionPersistence: sp, stagingRoot })
-    assert.equal(out.error, null, '单条失败不升级为 fatal')
-    assert.ok(out.registryWarnings.length >= 3, '异常全部转为 warning')
-
-    const cycleHome = path.join(home, 's8-engine')
-    const throwingRegistry = {
-      async resolveByPath() { throw new Error('resolve exploded') },
-      async create() { throw new Error('create exploded') },
-      list() { throw new Error('list exploded') },
-      async archiveSession() { throw new Error('archive exploded') },
-      async pinSession() { throw new Error('pin exploded') },
-    }
-    const engine = createEngine({ rowConfig: {
-      dshHome: cycleHome, deviceName: 's8', listenPort: 0, token: 't', settleSec: 0,
-    }, services: {
-      workspaceRegistry: throwingRegistry,
-      sessionPersistence: { async stat() { throw new Error('stat exploded') } },
-    } })
+    // 8a 缺信封 → mergeWorkspace 整体拒绝（merged:false）→ 不应用
+    const cycleHome = path.join(home, 's8-engine-envelope')
+    const registry = mockRegistry(emptyState())
+    const sp = mockSessionPersistence(new Set(['s1']))
+    const engine = createEngine({ rowConfig: { dshHome: cycleHome, deviceName: 's8', listenPort: 0, token: 't', settleSec: 0 } })
+    engine.setServices({ workspaceRegistry: registry, sessionPersistence: sp })
     try {
       await engine.init()
-      await writeStaging(path.join(cycleHome, 'plugin-sync/staging'), doc({ '/nowhere/ws': wsEntry('/nowhere/ws', 'W', ['s1']) }))
+      const noEnvelope = doc({ '/nowhere/ws': wsEntry('/nowhere/ws', 'W', ['s1']) })
+      delete noEnvelope.unit
+      await writeStaging(path.join(cycleHome, 'plugin-sync/staging'), noEnvelope)
       const summary = await engine.runCycle()
-      assert.equal(summary.workspaceWriteMode, 'registry')
-      assert.ok(summary.registryWarnings.length >= 1, 'registry 异常进入 registryWarnings')
-      assert.ok(summary.registryWarnings.every((w) => w.startsWith('registry:')), 'warning 统一前缀')
-      const status = await engine.status()
-      assert.deepEqual(status.registryWarnings, summary.registryWarnings)
+      assert.equal(summary.workspaceWriteMode, 'registry', '服务可用，但应用被门禁拦截')
+      assert.equal(summary.registryApplied, null, 'merged:false → 不应用')
+      zeroMutationCalls(registry, sp, '8a')
+      assert.ok(summary.errors.some((m) => m.includes('信封')), '合并中止错误可见')
+      assert.ok(summary.warnings.some((m) => m.includes('零 mutation')), '跳过原因可见')
     } finally {
       await engine.close()
     }
-    console.log('场景8 全异常捕获不中断、cycle 正常返回 PASS')
+
+    // 8b 信封合法但条目非法（缺 createdAt）→ merged:true 但合并 errors 非空 → 仍零 mutation
+    const cycleHome2 = path.join(home, 's8-engine-entry')
+    const proj = await freshDir('s8-entry/projects/alpha')
+    const registry2 = mockRegistry(emptyState())
+    const sp2 = mockSessionPersistence(new Set())
+    const engine2 = createEngine({ rowConfig: { dshHome: cycleHome2, deviceName: 's8b', listenPort: 0, token: 't', settleSec: 0 } })
+    engine2.setServices({ workspaceRegistry: registry2, sessionPersistence: sp2 })
+    try {
+      await engine2.init()
+      // 宿主已有合法文件：让合并走「宽容跳过坏条目」路径（merged:true + errors 非空）
+      await writeHostWorkspace(cycleHome2, doc({}))
+      await writeStaging(path.join(cycleHome2, 'plugin-sync/staging'), doc({
+        [proj]: { path: proj, title: 'Alpha', sessionIds: [], updatedAt: '2026-01-02T00:00:00Z' },
+      }))
+      const summary = await engine2.runCycle()
+      assert.equal(summary.merged, 1, '合并本身成功')
+      assert.equal(summary.registryApplied, null, 'errors 非空 → 不应用')
+      zeroMutationCalls(registry2, sp2, '8b')
+      assert.ok(summary.errors.some((m) => m.includes('createdAt')), '合并错误保留可见')
+      assert.ok(summary.warnings.some((m) => m.includes('零 mutation')), '跳过原因可见')
+    } finally {
+      await engine2.close()
+    }
+    console.log('场景8 R3 engine 门禁（merged:false / errors 非空 → 零 mutation） PASS')
   }
 
-  // ---------- engine + index 接入：注入服务 → registry 模式；注入抛错/缺失 → proposal ----------
+  // ---------- 场景 9：R1 注入契约与降级（entry 级 + setServices 服务校验） ----------
   {
-    const cycleHome = path.join(home, 's9-engine')
-    const proj = await freshDir('s9/projects/alpha')
-    const state = { byPath: new Map(), sessions: new Set(['s1', 'sa']), activeSessions: new Set(['sa']), archived: new Set(), pinned: new Set() }
+    // 9a mock ctx.inject 以 Cordis 契约 (injectCtx, undefined) 调用回调 → registry 模式；卸载清理回退 proposal
+    const entryHome = path.join(home, 's9-entry')
+    const proj = await freshDir('s9-entry/projects/alpha')
+    const state = emptyState()
+    state.sessions = new Set(['s1'])
     const registry = mockRegistry(state)
     const sp = mockSessionPersistence(state.sessions)
-    const engine = createEngine({ rowConfig: {
-      dshHome: cycleHome, deviceName: 's9', listenPort: 0, token: 't', settleSec: 0,
-    }, services: { workspaceRegistry: registry, sessionPersistence: sp } })
+    const registered = new Map()
+    const disposers = []
+    const injectCalls = []
+    let injectDispose = null
+    const ctx = {
+      inject(names, cb) {
+        injectCalls.push(names)
+        const dispose = cb({ workspaceRegistry: registry, sessionPersistence: sp }, undefined)
+        if (typeof dispose === 'function') injectDispose = dispose
+      },
+      effect(fn) { const dispose = fn(); if (typeof dispose === 'function') disposers.push(dispose); return dispose },
+      tools: { register(tool) { registered.set(tool.name, tool); return () => registered.delete(tool.name) } },
+    }
+    applyPlugin(ctx, { dshHome: entryHome, listenPort: 0, token: 'entry-token', settleSec: 0 })
+    const statusTool = registered.get('dsh_sync_status')
+    const syncTool = registered.get('dsh_sync_now')
+    try {
+      assert.deepEqual(injectCalls, [['workspaceRegistry', 'sessionPersistence']], '只注入 registry 两服务')
+      assert.equal((await statusTool.execute()).workspaceWriteMode, 'registry', 'R1：回调参数即注入 Context，服务立即可用')
+      assert.equal((await statusTool.execute()).registryAvailable, true)
+      await writeStaging(path.join(entryHome, 'plugin-sync/staging'), doc({ [proj]: wsEntry(proj, 'Alpha', ['s1']) }))
+      const summary = await syncTool.execute()
+      assert.equal(summary.workspaceWriteMode, 'registry')
+      assert.deepEqual(summary.registryApplied, { workspaces: 1, created: 1, sessions: 1, archived: 0, pinned: 0 })
+    } finally {
+      // 卸载顺序模拟 Cordis：先 effect 清理（关引擎），再 inject 清理（setServices(null)）
+      for (const dispose of disposers.reverse()) await dispose()
+      if (injectDispose) await injectDispose()
+    }
+    const after = await statusTool.execute()
+    assert.equal(after.registryAvailable, false, '注入清理后立即回退 proposal（无需等下一轮）')
+    assert.equal(after.workspaceWriteMode, 'proposal')
+    console.log('场景9a R1 入口注入契约（(injectCtx, config) → registry 模式 / 清理 → proposal） PASS')
+
+    // 9b 宿主无 inject → proposal，工具照常可用
+    {
+      const noInjectHome = path.join(home, 's9-noinject')
+      const registered2 = new Map()
+      const disposers2 = []
+      const ctx2 = {
+        effect(fn) { const dispose = fn(); if (typeof dispose === 'function') disposers2.push(dispose); return dispose },
+        tools: { register(tool) { registered2.set(tool.name, tool); return () => registered2.delete(tool.name) } },
+      }
+      applyPlugin(ctx2, { dshHome: noInjectHome, listenPort: 0, token: 't', settleSec: 0 })
+      try {
+        const st = await registered2.get('dsh_sync_status').execute()
+        assert.equal(st.workspaceWriteMode, 'proposal', '不注入回退 proposal')
+        assert.equal(st.registryAvailable, false)
+        const sync = await registered2.get('dsh_sync_now').execute()
+        assert.equal(sync.workspaceWriteMode, 'proposal')
+      } finally {
+        for (const dispose of disposers2.reverse()) await dispose()
+      }
+    }
+
+    // 9c 注入抛错 → proposal，不向上抛
+    {
+      const throwHome = path.join(home, 's9-throwinject')
+      const registered3 = new Map()
+      const disposers3 = []
+      const ctx3 = {
+        inject() { throw new Error('host refuses injection') },
+        effect(fn) { const dispose = fn(); if (typeof dispose === 'function') disposers3.push(dispose); return dispose },
+        tools: { register(tool) { registered3.set(tool.name, tool); return () => registered3.delete(tool.name) } },
+      }
+      applyPlugin(ctx3, { dshHome: throwHome, listenPort: 0, token: 't', settleSec: 0 })
+      try {
+        const st = await registered3.get('dsh_sync_status').execute()
+        assert.equal(st.workspaceWriteMode, 'proposal', '注入抛错不向上抛，回退 proposal')
+        assert.equal(st.registryAvailable, false)
+      } finally {
+        for (const dispose of disposers3.reverse()) await dispose()
+      }
+    }
+
+    // 9d 服务可用性按契约方法集判定（NIT）：缺任一方法/空对象 → proposal
+    {
+      const svcHome = path.join(home, 's9-services')
+      const engine = createEngine({ rowConfig: { dshHome: svcHome, deviceName: 's9', listenPort: 0, token: 't', settleSec: 0 } })
+      try {
+        await engine.init()
+        const full = mockRegistry(emptyState())
+        const noList = { create: full.create, resolveByPath: full.resolveByPath, archiveSession: full.archiveSession, pinSession: full.pinSession }
+        engine.setServices({ workspaceRegistry: noList, sessionPersistence: { stat: async () => undefined } })
+        let st = await engine.status()
+        assert.equal(st.registryAvailable, false, '缺 list 的 registry 视为不可用')
+        assert.equal(st.workspaceWriteMode, 'proposal')
+        engine.setServices({ workspaceRegistry: {}, sessionPersistence: {} })
+        st = await engine.status()
+        assert.equal(st.registryAvailable, false, '空对象同样不可用')
+        engine.setServices({ workspaceRegistry: full, sessionPersistence: { stat: async () => ({ id: 'x' }) } })
+        st = await engine.status()
+        assert.equal(st.registryAvailable, true, '方法齐全才可用')
+        assert.equal(st.workspaceWriteMode, 'registry')
+        engine.setServices(null)
+        st = await engine.status()
+        assert.equal(st.registryAvailable, false, 'setServices(null) 立即回退')
+        assert.equal(st.workspaceWriteMode, 'proposal')
+      } finally {
+        await engine.close()
+      }
+      assert.equal(registryServicesUsable(null, null), false)
+      assert.equal(registryServicesUsable({ create() {}, resolveByPath() {}, list() {}, archiveSession() {}, pinSession() {} }, {}), false, '缺 stat 不可用')
+    }
+    console.log('场景9 R1 注入降级（无 inject/抛错/服务校验） PASS')
+  }
+
+  // ---------- 场景 10：engine registry 正常路径 + 幂等 + 状态 + stat 抛错引擎级可见 ----------
+  {
+    const cycleHome = path.join(home, 's10-engine')
+    const proj = await freshDir('s10/projects/alpha')
+    const state = emptyState()
+    state.sessions = new Set(['s1', 'sa'])
+    state.activeSessions = new Set(['sa'])
+    const registry = mockRegistry(state)
+    const sp = mockSessionPersistence(state.sessions)
+    const engine = createEngine({ rowConfig: { dshHome: cycleHome, deviceName: 's10', listenPort: 0, token: 't', settleSec: 0 } })
+    engine.setServices({ workspaceRegistry: registry, sessionPersistence: sp })
     try {
       await engine.init()
       await writeStaging(path.join(cycleHome, 'plugin-sync/staging'), doc({
@@ -391,12 +616,10 @@ try {
       const summary = await engine.runCycle()
       assert.equal(summary.workspaceWriteMode, 'registry', 'engine 在 apply 后走 registry 应用')
       assert.equal(summary.registryAvailable, true)
-      assert.equal(summary.registryApplied.workspaces, 1)
-      assert.equal(summary.registryApplied.created, 1)
-      assert.equal(summary.registryApplied.sessions, 1)
-      assert.equal(summary.registryApplied.archived, 0, 'active 会话归档失败只留 warning')
+      assert.deepEqual(summary.registryApplied, { workspaces: 1, created: 1, sessions: 1, archived: 0, pinned: 0 }, 'active 会话归档失败只留 warning')
       assert.ok(summary.registryWarnings.some((w) => w.includes('sa')), 'active 归档 warning 可见')
       assert.ok(!summary.warnings.some((w) => w.includes('建议')), 'registry 模式不再提示待人工应用')
+      assert.deepEqual(registry.calls.setTitle, [], 'R2：宿主 setTitle 永不被插件调用')
       assert.equal(registry.calls.create.length, 1)
       const second = await engine.runCycle()
       assert.equal(second.registryApplied.created, 0, '第二轮零 create（幂等）')
@@ -405,55 +628,41 @@ try {
       const status = await engine.status()
       assert.equal(status.workspaceWriteMode, 'registry')
       assert.equal(status.registryAvailable, true)
-      assert.deepEqual(status.registryLastApplied, { at: second.at, workspaces: 1, created: 0, sessions: 0, archived: 0, pinned: 0, titles: 0 })
+      assert.deepEqual(status.registryLastApplied, { at: second.at, workspaces: 1, created: 0, sessions: 0, archived: 0, pinned: 0 })
       assert.deepEqual(await fsp.readdir(path.join(cycleHome, 'storages')).catch(() => []), [], 'registry 模式下宿主 storages 仍零写入')
       assert.equal(summary.proposalPending, true, 'proposal 文件仍生成（审计/降级用）')
     } finally {
       await engine.close()
     }
 
-    // index.js 注入形态：数组返回 → registry；注入抛错 → proposal 不抛
-    const home2 = path.join(home, 's9-entry')
-    const proj2 = await freshDir('s9-entry/projects/beta')
-    const state2 = { byPath: new Map(), sessions: new Set(['s2']), activeSessions: new Set(), archived: new Set(), pinned: new Set() }
-    const registry2 = mockRegistry(state2)
-    const sp2 = mockSessionPersistence(state2.sessions)
-    const engine2 = createEngine({ rowConfig: { dshHome: home2, deviceName: 'entry', listenPort: 0, token: 't', settleSec: 0 }, services: [registry2, sp2] })
+    // stat 抛错的引擎级表现：单条失败全部转 registryWarnings，cycle 正常完成
+    const statHome = path.join(home, 's10-engine-stat')
+    const proj3 = await freshDir('s10-stat/projects/alpha')
+    const registry3 = mockRegistry(emptyState())
+    const engine3 = createEngine({ rowConfig: { dshHome: statHome, deviceName: 's10b', listenPort: 0, token: 't', settleSec: 0 } })
+    engine3.setServices({
+      workspaceRegistry: registry3,
+      sessionPersistence: { async stat() { throw new Error('stat exploded') }, async list() { return [] } },
+    })
     try {
-      await engine2.init()
-      await writeStaging(path.join(home2, 'plugin-sync/staging'), doc({ [proj2]: wsEntry(proj2, 'beta', ['s2']) }))
-      const summary2 = await engine2.runCycle()
-      assert.equal(summary2.workspaceWriteMode, 'registry', '数组形态服务同样生效')
-      assert.equal(summary2.registryApplied.created, 1)
+      await engine3.init()
+      await writeStaging(path.join(statHome, 'plugin-sync/staging'), doc({
+        [proj3]: wsEntry(proj3, 'Alpha', ['s1']),
+      }, { archivedSessionIds: ['sa2'] }))
+      const summary = await engine3.runCycle()
+      assert.equal(summary.workspaceWriteMode, 'registry')
+      assert.ok(summary.registryWarnings.length >= 2, 'stat 抛错：归档与附加各一条 warning')
+      assert.ok(summary.registryWarnings.every((w) => w.startsWith('registry:')), 'warning 统一前缀')
+      assert.deepEqual(registry3.calls.create, [proj3], 'stat 抛错不阻塞 workspace 级 create')
+      const status = await engine3.status()
+      assert.deepEqual(status.registryWarnings, summary.registryWarnings)
     } finally {
-      await engine2.close()
+      await engine3.close()
     }
-
-    const registered = new Map()
-    const disposers = []
-    const injectCalls = []
-    const entryHome = path.join(home, 's9-index')
-    const ctx = {
-      inject(names) { injectCalls.push(names); throw new Error('host refuses injection') },
-      effect(fn) { const dispose = fn(); if (typeof dispose === 'function') disposers.push(dispose); return dispose },
-      tools: { register(tool) { registered.set(tool.name, tool); return () => registered.delete(tool.name) } },
-    }
-    applyPlugin(ctx, { dshHome: entryHome, listenPort: 0, token: 'entry-token', settleSec: 0 })
-    try {
-      const status = () => registered.get('dsh_sync_status').execute()
-      const sync = () => registered.get('dsh_sync_now').execute()
-      assert.deepEqual(injectCalls, [['workspaceRegistry', 'sessionPersistence']], '只注入 registry 两服务，不再注入 storageDomain')
-      const summary = await sync()
-      assert.equal(summary.workspaceWriteMode, 'proposal', '注入抛错不向上抛，回退 proposal')
-      assert.equal(summary.registryAvailable, false)
-      assert.equal((await status()).registryAvailable, false)
-    } finally {
-      for (const dispose of disposers.reverse()) await dispose()
-    }
-    console.log('engine/index 接入（registry 模式/幂等/状态/注入降级） PASS')
+    console.log('场景10 engine registry 正常路径/幂等/状态/stat 抛错 PASS')
   }
 
-  console.log('ALL PASS（registry.test.mjs：8 类场景 + engine/index 接入）')
+  console.log('ALL PASS（registry.test.mjs：R1-R5 覆盖，10 组场景）')
 } finally {
   await fsp.rm(home, { recursive: true, force: true })
 }

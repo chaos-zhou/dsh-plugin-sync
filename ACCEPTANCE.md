@@ -72,7 +72,7 @@ tests/engine.test.mjs               PASS（真实 HTTP 双节点）
 
 # v1.2 验收记录（PM 填写）
 
-日期：2026-11-04 开发完成，待 Codex 审核与 PM 实机验收。分支 `feat/v1.2-registry-apply`，版本 `1.2.0`。
+日期：2026-11-04 开发完成；同日 Codex 审核报 4 BLOCKER + 2 NIT，v1.2.1 修复完成，待 Codex 复审与 PM 实机验收。分支 `feat/v1.2-registry-apply`，版本 `1.2.1`。
 
 ## 0. 功能概述
 
@@ -82,21 +82,25 @@ tests/engine.test.mjs               PASS（真实 HTTP 双节点）
 
 | 门槛 | 结果 |
 |---|---|
-| `node --check`（index.js + hub.mjs + lib/*.js(11) + tests/*.mjs(7)） | 全部 exit 0 |
-| `node tests/registry.test.mjs` | exit 0，8 类场景 + engine/index 接入 9 组 ALL PASS（纯 mock） |
+| `node --check`（index.js + hub.mjs + lib/*.js(12) + tests/*.mjs(7)） | 全部 exit 0 |
+| `node tests/registry.test.mjs` | exit 0，10 组场景 ALL PASS（R1-R5 覆盖，纯 mock） |
 | 既有 6 个测试（workspace.compat / apply.compat / engine.offline / fixture.accept / security.symlink / engine） | 全部 exit 0，ALL PASS |
 | grep：registry-apply.js 无 fs 写调用 | 通过（仅 `fsp.stat` 只读） |
-| grep：无宿主 storages 文件写 | 通过（`storages/workspace.json` 仍只有 2 处只读） |
+| grep：registry-apply.js 无 setTitle / 无 pathRemap | 通过（v1.2.1 R2/R4） |
+| grep：无宿主 storages 文件写 | 通过（`storages/workspace.json` 只读） |
 
-## 2. Codex 审核（待填写）
+## 2. Codex 审核
 
 | 轮次 | 结论 | BLOCKER/NIT |
+|---|---|---|
+| 第 1 轮（审 v1.2.0） | 需修复 | 4 BLOCKER + 2 NIT（注入契约用错、标题竞争、坏文档被应用、路径映射两次；测试整体短路、服务判定过松），见 `FIX-SPEC-v1.2.1.md` |
+| 第 2 轮（复审 v1.2.1） | 待填写 | |
 |---|---|---|
 
 ## 3. PM 实机验收（待填写）
 
 - [ ] 重载插件（bundle 关→开），`dsh_sync_status` 显示 `workspaceWriteMode: 'registry'`、`registryAvailable: true`；
 - [ ] 从对端拉来的会话出现在本机对应工作区，且宿主 `storages/workspace.json` 的变化**由宿主自身写入**（`domain/changed` / registry mutation queue），可证明非插件 safe-writer 所为（对比启用前后 sha256 与插件写面自检）；
-- [ ] 幂等：连续两轮 `dsh_sync_now`，第二轮 `registryApplied` 的 created/sessions/archived/pinned/titles 为 0；
+- [ ] 幂等：连续两轮 `dsh_sync_now`，第二轮 `registryApplied` 的 created/sessions/archived/pinned 为 0；
 - [ ] 降级：临时移除 registry 服务注入后，`workspaceWriteMode` 回到 `'proposal'` 且行为同 v1.1.2；
 - [ ] 宿主文件 sha256 记录：启用前 ________ / 启用后 ________（应仅由宿主自身操作引起变化）。

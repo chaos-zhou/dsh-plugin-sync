@@ -307,3 +307,48 @@ grep 自检（实测）：
 4. **registryLastApplied 仅进程内存活**：插件重载后为 `null`，下一轮成功应用后重建；不影响正确性（现状每轮从 registry 重读）。
 5. **未做跨工作区移动**：会话已在本地其他工作区时，本版本仍会 attach 到远端声明的工作区（不 detach 原工作区）；「会话搬家」场景未在规格内，两列表可能同时含该会话。
 6. **交 Codex 审核与 PM 实机验证（`workspaceWriteMode:'registry'` 观察宿主自行落盘）尚未执行**，见 ACCEPTANCE.md v1.2 章节。
+
+# Claude Code 本轮（v1.2.1 registry applier 修复：4 BLOCKER + 2 NIT）
+
+日期：2026-11-04。环境：Node.js v24.15.0，macOS。依据 `FIX-SPEC-v1.2.1.md`（Codex 对 v1.2 的审核结论）。版本 `1.2.1`。分支 `feat/v1.2-registry-apply`。
+
+## 修复对照
+
+| 项 | v1.2 问题 | v1.2.1 修复 |
+|---|---|---|
+| BLOCKER 1 注入契约 | `index.js` 把 `ctx.inject(deps, cb)` 的回调参数当服务数组解析，服务齐全也永远降级 proposal | 回调改为 `(injectCtx) => { engine.setServices(injectCtx 的两服务); return () => engine.setServices(null) }`（index.js:14-27）；新增 `engine.setServices` 运行时**原子替换**服务句柄，置空/不满足契约**立即**把 `registryAvailable=false`、`workspaceWriteMode` 回 `'proposal'`（无需等下一轮）。移除旧的 promise 句柄解析（`opts.services` 四形态兼容层整体删除） |
+| NIT 1 服务判定 | engine 仅凭两个 object 判定可用，空对象也显示 registry 模式 | 新导出 `registryServicesUsable`（lib/registry-apply.js）：`workspaceRegistry` 必须同时具备 `create/resolveByPath/list/archiveSession/pinSession` 函数、`sessionPersistence` 必须具备 `stat` 函数，否则不可用；`setServices` 与每轮 `runCycle` 都用它重判 |
+| BLOCKER 2 标题竞争 | 标题条件在 mutation queue 外判断，随后无条件 `setTitle`，覆盖先排队的本地改名 | **applier 完全不再调用 `setTitle`**；远端标题仅在 `registry.create(path, title)` 新建时传入，既有 workspace 保持本地标题。`registryApplied` 移除恒零的 `titles` 计数。工作区重命名不跨设备同步（等宿主提供条件更新 API），已写入 README |
+| BLOCKER 3 坏文档被应用 | 缺 `unit` 的文档绕过 applier 校验；合并拒绝也不阻止 registry mutation | engine 双重门禁（lib/engine.js runCycle）：①仅「`merged:true` 且本轮合并 `errors` 为空」的 `mergeWorkspace` 产物才允许应用；②应用前 `validateWorkspaceDoc(doc, { requireEnvelope: true })`，失败记 error 零 mutation。applier 入口再防御性自检一次，失败直接返回、不调用任何 registry API（连 `stat` 都不调） |
+| BLOCKER 4 路径映射两次 | staging 已由 `mergeWorkspace` 映射过，applier 再映射 → `/a → /a/local → /a/local/local` | `registry-apply.js` 删除 `applyRemap`/`pathRemap`，输入改为 engine 直接传 merge 产物（路径已本地化，注释注明）。回归测试的 `pathRemap` 故意取 `to = from + '/local'`（二次映射必产生 `/local/local` 与目录不存在警告），断言 `resolveByPath` 收到的就是映射一次后的最终路径且警告为零 |
+| NIT 2 测试短路 | `tests/registry.test.mjs` 同时开全部故障，前置 stat/resolve 错误掩盖 create/attach/setTitle/archive/pin 分支 | 重写为**逐 API 故障注入**（6 子例）：resolveByPath / create / stat / attachSession / archiveSession / pinSession 各自单独注入，各断言 ①错误进 warnings；②后续条目继续处理；③其它 API 调用次数符合预期（证明未被整体短路） |
+
+测试文件重写为 10 组场景：正常路径+R2 标题、幂等、applier 防御自检（4 类坏文档零 mutation，含缺 unit/缺 initialized/条目非法/null）、缺目录跳过、archive/pin 增量、逐 API 故障注入（6 子例）、R4 单次映射（engine 全链路）、R3 engine 门禁（merged:false 与 errors 非空两条路径）、R1 入口注入契约（mock `(injectCtx, undefined)` 回调 → registry 模式；清理 → 立即 proposal；无 inject/抛错/缺方法/空对象 → proposal）、engine 正常路径+幂等+`registryLastApplied` 形状+stat 抛错引擎级可见。
+
+## 验收命令与结果（实测）
+
+`node --check`：`index.js`、`hub.mjs`、`lib/*.js`(12)、`tests/*.mjs`(7) 全部 exit 0。
+
+| 命令 | 结果 |
+|---|---|
+| `node tests/registry.test.mjs` | exit 0，10 组场景 ALL PASS（纯 mock，不碰真实宿主） |
+| `node tests/workspace.compat.test.mjs` | exit 0，ALL PASS |
+| `node tests/apply.compat.test.mjs` | exit 0，ALL PASS |
+| `node tests/engine.offline.test.mjs` | exit 0，ALL PASS |
+| `node tests/fixture.accept.test.mjs` | exit 0，ALL PASS |
+| `node tests/security.symlink.test.mjs` | exit 0，ALL PASS |
+| `node tests/engine.test.mjs` | exit 0，ALL PASS（真实 HTTP 双节点） |
+
+grep 自检（实测）：
+
+- `lib/registry-apply.js` 无任何 fs 写调用：仅 `node:fs/promises` 的 `fsp.stat`（只读）；
+- 全仓库仍无对宿主 `storages/workspace.json` 的写/删/rename/copy；写调用全部收敛 `lib/safe-writer.js`；
+- `lib/registry-apply.js` 无 `setTitle`、无 `applyRemap`；宿主 API 调用面：`create`/`resolveByPath`/`archiveSession`/`pinSession`/`attachSession`/`sessionPersistence.stat`。
+
+## 遗留风险（如实声明）
+
+1. **合并错误即跳过整轮 registry 应用**：远端偶发坏条目会让该轮 `errors` 非空 → 本轮零 mutation（下轮重试）。这是 R3 的保守设计：宁可晚一轮应用，也不应用未经完整校验的产物。若远端持续发坏数据，registry 应用会持续跳过（proposal 文件仍生成，不影响合并本身）。
+2. **工作区重命名不再跨设备同步**：两端各自保留本地标题；远端标题只影响新建工作区。属 R2 的有意取舍（宿主无条件更新 API）。
+3. **宿主 no-op 语义依赖契约**：attach/archive/pin 的幂等仍依赖宿主「重复调用无害」承诺（v1.2 遗留，不变）。
+4. **stat 与宿主识别的时差 / archiveSession 不强停 / registryLastApplied 进程内存活 / 未做跨工作区移动**：均沿袭 v1.2，见上一节。
+5. **交 Codex 复审与 PM 实机验证尚未执行**：重载插件后需观察 `workspaceWriteMode:'registry'` 且对端会话出现在本机工作区（宿主自行落盘），见 ACCEPTANCE.md。

@@ -135,30 +135,34 @@ hub 只做字节中转（`/v1/ping`、`/v1/index`、`/v1/blob`），不解析 DS
 v1.2 起有两种模式，由宿主是否提供事务 API 自动决定（`dsh_sync_status` / `dsh_sync_now` 的 `workspaceWriteMode` 字段）：
 
 - **registry 模式**（`workspaceWriteMode: 'registry'`）：宿主提供 `ctx.workspaceRegistry` 与 `ctx.sessionPersistence` 时，每轮 apply 之后把合并结果经宿主事务 API 增量应用到本机。**插件仍不写任何宿主 JSON 文件**——所有变更都是宿主 mutation queue 内的单条持久化操作，宿主自己落盘并发 `domain/changed` 事件。
-- **proposal 模式**（`workspaceWriteMode: 'proposal'`，v1.1.2 行为）：服务不可用（宿主无 inject、服务缺失、注入抛错）时自动回退；合并结果只写建议文件，等待人工应用。
+- **proposal 模式**（`workspaceWriteMode: 'proposal'`，v1.1.2 行为）：服务不可用（宿主无 inject、服务缺失方法、注入抛错、注入清理后）时自动回退；合并结果只写建议文件，等待人工应用。
 
 两种模式下 proposal 文件都继续生成（审计与降级后备），只是 registry 模式不再提示「待人工应用」。
+
+**注入方式（v1.2.1 修正）**：插件经 `ctx.inject(['workspaceRegistry', 'sessionPersistence'], (injectCtx) => { … engine.setServices(...) … })` 获取服务——按 Cordis 契约，服务从**回调参数**（注入后的 Context）读取；回调返回的函数由宿主用作卸载清理，清理即 `setServices(null)` **立即**回退 proposal（无需等下一轮）。服务可用性按契约方法集判定：`workspaceRegistry` 必须同时具备 `create/resolveByPath/list/archiveSession/pinSession`，`sessionPersistence` 必须具备 `stat`；空对象或残缺服务一律视为不可用。
 
 ### 自动应用（registry 模式）
 
 实现位于 `lib/registry-apply.js`，每轮 `cycle()` 在会话/附件落回（apply）**之后**执行——这样本轮刚同步过来的会话文件有机会被宿主识别，下一轮即可 attach。
 
-**输入**：staging 里合并后的 `workspace/workspace.json`（含远端工作区、归档/置顶集合的并集）＋从 registry 实时读取的本机现状。每轮都重新读现状算差量，不缓存本地快照。
+**输入**：engine 传入的**合并产物**（含远端工作区、归档/置顶集合的并集，其中路径已完成 `pathRemap` 本地化）＋从 registry 实时读取的本机现状。每轮都重新读现状算差量，不缓存本地快照。
 
-**只使用这些宿主 API**：`workspaceRegistry.create / resolveByPath / archiveSession / pinSession`、`Workspace.attachSession / setTitle`、`sessionPersistence.stat`。`lib/registry-apply.js` 内没有任何 fs 写调用（仓库 grep 自检佐证）；unarchive/unpin/insertBefore 等减序 API 一律不调用——**远端状态只加不减**。
+**零 mutation 条件（v1.2.1）**：只有「本轮合并成功（`merged:true`）且合并 `errors` 为空、产物通过 `validateWorkspaceDoc(requireEnvelope)`」才会调用任何 registry API；合并被拒、存在合并错误、产物校验失败时**一轮内零 create/attach/archive/pin/stat**（applier 入口还会防御性自检一次）。
+
+**只使用这些宿主 API**：`workspaceRegistry.create / resolveByPath / archiveSession / pinSession`、`Workspace.attachSession`、`sessionPersistence.stat`。`lib/registry-apply.js` 内没有任何 fs 写调用（仓库 grep 自检佐证）；unarchive/unpin/insertBefore 等减序 API 一律不调用——**远端状态只加不减**；`setTitle` 不再调用（见下）。
 
 | 步骤 | 行为 |
 |---|---|
 | 归档/置顶 | 远端 `archivedSessionIds` / `pinnedSessionIds` 逐条增量：宿主未识别（`stat` 缺失）→ warning 跳过下轮重试；归档活动中的会话（`WorkspaceActiveSessionError`）→ warning 跳过，**绝不 `stopActivity` 强停用户会话**；pin 已归档/不存在 → warning 跳过 |
-| 工作区 | 远端 `path` 先过 `pathRemap` 映射，再 `fs.stat` 确认本地是真实目录（缺失/不是目录 → warning 跳过该工作区及其全部会话）；`resolveByPath` 未命中才 `create(path, title)`（目录复用，不重命名） |
+| 工作区 | 路径（已本地化，不再二次映射）经 `fs.stat` 确认本地是真实目录（缺失/不是目录 → warning 跳过该工作区及其全部会话）；`resolveByPath` 未命中才 `create(path, title)`（目录复用，远端标题仅随新建传入） |
 | 会话 | 远端 `sessionIds` 中本工作区尚没有的 id：宿主未识别 → warning 下轮重试；否则 `attachSession`（已存在不重复 attach） |
-| 标题 | 仅当远端标题非空、与本地不同、且**本地标题仍等于本地目录 basename**（即从未被本地改过名）时 `setTitle(remote.title)`；本地已改名则保留本地标题，避免两端改名互相覆盖/震荡；规则单调，收敛后不再调用 |
+| 标题 | **既有 workspace 不跨设备同步重命名**（v1.2.1 起）：远端标题只在 `create` 新建时传入；已存在的 workspace 保持本地标题。原因：宿主 mutation queue 没有条件更新 API，任何「先比对再 setTitle」都与队列内排队的本地改名竞争、必然互相覆盖；等宿主提供条件更新 API 后再恢复跟随 |
 
-**幂等与并发语义**：attach/archive/pin/setTitle 都是宿主 mutation queue 内的单条持久化操作，重复调用应无害（已 attach 不重复、已归档/已置顶为 no-op、标题规则单调）。全部已存在时一轮的增量为零（`registryApplied` 各计数为 0，仅 `workspaces` 表示「确认存在」的工作区数，其中 `created` 为本轮实际新建数）。单条失败记入 `registryWarnings[]`，下一轮自动重试，**不做整轮回滚**。
+**幂等与并发语义**：attach/archive/pin 都是宿主 mutation queue 内的单条持久化操作，重复调用应无害（已 attach 不重复、已归档/已置顶为 no-op）。全部已存在时一轮的增量为零（`registryApplied` 各计数为 0，仅 `workspaces` 表示「确认存在」的工作区数，其中 `created` 为本轮实际新建数）。单条失败记入 `registryWarnings[]`，下一轮自动重试，**不做整轮回滚**。
 
-**跨系统路径映射**：远端工作区路径先用配置 `pathRemap: [{from, to}]` 做字符串替换（与 proposal 合并同一实现 `applyRemap`），例如 macOS 的 `/Users/x/proj` ↔ Linux 的 `/home/x/proj`。映射后本地不存在的工作区整条跳过（含其会话），不猜测、不创建目录。
+**跨系统路径映射（只映射一次）**：远端工作区路径在合并阶段用配置 `pathRemap: [{from, to}]` 做字符串替换（`lib/workspace.js` 的 `applyRemap`），例如 macOS 的 `/Users/x/proj` ↔ Linux 的 `/home/x/proj`；applier 直接使用合并产物中的路径，**绝不再做第二次映射**（v1.2 的二次映射曾把 `/a` 变成 `/a/local/local` 导致正确目录被跳过）。映射后本地不存在的工作区整条跳过（含其会话），不猜测、不创建目录。
 
-**失败契约**：applier 自身不抛出——单条失败一律转 `registryWarnings[]`（前缀 `registry:`）并计入 `dsh_sync_status`；只有 staging 文档读取失败/信封无效这类无法继续的情况才升级为本轮 `errors[]`。状态字段：`registryAvailable`（本轮服务是否可用）、`registryApplied`（本轮增量 `{workspaces, created, sessions, archived, pinned, titles}`）、`registryLastApplied`（最近一次成功应用摘要）、`registryWarnings`（最近一轮的警告）。
+**失败契约**：applier 自身不抛出——单条失败一律转 `registryWarnings[]`（前缀 `registry:`）并计入 `dsh_sync_status`；合并被拒、合并错误、产物校验失败这类「不能安全应用」的情况升级为本轮 `errors[]`/`warnings[]` 并零 mutation 跳过。状态字段：`registryAvailable`（本轮服务是否可用）、`registryApplied`（本轮增量 `{workspaces, created, sessions, archived, pinned}`）、`registryLastApplied`（最近一次成功应用摘要）、`registryWarnings`（最近一轮的警告）。
 
 **安全约束不变**：不写宿主文件、全部文件写仍经 `lib/safe-writer.js`、proposal 持续生成。若需要回退到纯 proposal 行为，把插件 bundle 换回 v1.1.2 或在宿主侧停掉 registry 服务注入即可。
 
