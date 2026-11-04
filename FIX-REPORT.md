@@ -367,3 +367,20 @@ v1.2.3-v1.2.5 尝试在合并阶段映射派生文档，被 Codex 连续指出�
 ## 验证
 - registry.test.mjs 新增：applier 映射两轮稳定、合并阶段保留原路径、非法规则零 mutation、链式规则单次应用稳定。
 - 全 seven suites exit 0。
+
+
+---
+
+# v1.3.1：修复 v1.3.0 的宿主反馈膨胀与规则前置问题
+
+Codex 审核 v1.3.0 指出：
+1. 合并基底含宿主本机条目，applier 再映射本机路径 → `/a→/a/local` 逐轮膨胀并重复 attach。
+2. 非法 pathRemap 规则在 archive/pin 之后才校验 → 仍产生 mutation。
+3. 空规则时未校验 `ws.path`（`.`、相对路径、UNC 可进入宿主）。
+4. 路径规范化改变语义（UNC、POSIX 中的反斜杠、根 `/`、`C:/`）。
+
+修复：
+- applier 先做规则校验（非法 → 整轮零 mutation）；每个工作区先做 `isSafeAbsolutePath`；路径本机存在 → 直接使用不映射，不存在才映射一次。
+- `normalizeRemapRules`/`isSafeAbsolutePath`/`mapPathOnce` 严格化：仅 POSIX/盘符绝对路径，拒绝 UNC 与点段，保留根，盘符大写归一，POSIX 路径不转换反斜杠。
+- 测试新增：反馈循环三轮不映射、非法规则零 archive/pin、`.` 路径零 mutation、UNC 拒绝、盘符大小写不敏感。
+- PM 真实数据验证：本机 path 不映射、远端 Windows path 映射一次、attach 6 会话、零 error。

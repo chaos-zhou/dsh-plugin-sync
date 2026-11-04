@@ -248,11 +248,9 @@ node tests/registry.test.mjs          # v1.2 registry 应用：12 组场景（�
 
 见 [docs/PUBLISHING.md](docs/PUBLISHING.md)：仓库初始化、`package.json` 需要补的字段、`npm pack` 检查、版本与 tag、市场提交前自检清单。
 
-## v1.3.0：路径映射只在应用时做一次
+## v1.3.1：路径映射只在 registry 应用时做一次
 
-`pathRemap` 不再参与合并，也不再写入 proposal/staging；它只在 registry applier 真正使用远端工作区路径的那一刻应用一次：
-
-- 规则要求：`from`/`to` 必须是绝对路径，不能包含 `.`/`..` 段；空规则与 `from === to` 会被忽略；同一 `(from,to)` 去重。
-- 规则按配置顺序在**单次调用**内组合（可写链式，如 `/a→/b`、`/b→/c`），每轮从原始路径重新计算，因此不存在“已经映射过再映射”的膨胀问题。
-- 规则或路径非法时：整组映射禁用、warning 可见、当前工作区跳过（不再猜测路径）。
-- 派生文档（`staging/`、`proposed/`）保留远端原始路径；它们只是审计/缓存，不是最终路径来源。
+- **合并阶段完全不映射**：`staging/`、`proposed/` 保留远端原始路径（仅审计/缓存）。
+- registry applier 对每个工作区：路径在本机**真实存在** → 视为本机条目，直接使用，**绝不映射**（避免 `/a→/a/local` 逐轮膨胀）；不存在 → 才按 `pathRemap` 映射一次，再检查目标目录。
+- 规则要求：`from`/`to` 必须是绝对路径（POSIX 或 Windows 盘符，UNC 不支持），不能含 `.`/`..` 段；空规则与 `from===to` 忽略；同一 `(from,to)` 去重；规则按顺序在单次调用内组合（可写链式）；盘符大小写不敏感。
+- 规则非法 → 整轮**零 mutation**（连 archive/pin 都不执行），错误可见；路径非法（相对/点段/UNC）→ 跳过该工作区并 warning。
