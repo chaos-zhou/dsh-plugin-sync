@@ -163,15 +163,16 @@ async function testPluginEntryLifecycle() {
     applyPlugin(ctx, { dshHome: entryHome, listenPort: 0, token: 'entry-token', settleSec: 0 })
     const status = () => registered.get('dsh_sync_status').execute()
     const sync = () => registered.get('dsh_sync_now').execute()
-    assert.deepEqual(injectCalls, [], 'v1.1 不再请求注入 storageDomain')
+    // v1.2 只请求注入 registry 两服务；宿主未提供（mock 返回 undefined）时解析为不可用并回退 proposal。
+    assert.deepEqual(injectCalls, [['workspaceRegistry', 'sessionPersistence']], 'v1.2 只注入 workspaceRegistry/sessionPersistence，不再注入 storageDomain')
     assert.equal((await status()).workspaceWriteMode, 'proposal')
-    assert.equal((await sync()).proposalPending, true, '不注入任何服务也能执行工具')
+    assert.equal((await sync()).proposalPending, true, '宿主不提供 registry 服务也能执行工具（proposal 降级）')
     assert.equal((await status()).proposalPathSafe, true)
     assert.deepEqual(await fsp.readFile(hostFile), hostBytes, '宿主文件字节不变')
   } finally {
     for (const dispose of disposers.reverse()) await dispose()
   }
-  console.log('离线 index.apply不再注入storageDomain/工具全程proposal/宿主只读 PASS')
+  console.log('离线 index.apply只注入registry两服务/服务缺失降级proposal/宿主只读 PASS')
 }
 
 try {
