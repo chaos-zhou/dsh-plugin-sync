@@ -144,3 +144,21 @@ node tests/engine.test.mjs
 ```
 
 用两个临时 `dshHome` 起两个 engine（互为 peer），覆盖初始同步、工作区并集、两端同改冲突、幂等零流量四类场景，成功输出 `ALL PASS`。
+
+## 通过 Plugin Manager 安装（推荐，不要手动改 profile 文件）
+
+本包是标准 bundle，安装时会自动进 profile 层栈：
+
+- 在 DSH 会话里让 Agent 执行：`plugin_manager` → `install_bundle`，`target` 填**本目录绝对路径**；
+- 或命令行：`dsh plugin --profile desktop add /path/to/dsh-plugin-sync`，然后在 DSH 的「插件管理」里启用 `dsh-plugin-sync` 这一行；
+- 安装后不用重启即可通过 HMR 激活；替换已安装版本时按提示重启 DSH 载入新的 JavaScript 代际。
+
+装好后在会话里直接用三个工具：
+
+- `dsh_sync_status`：看状态（设备、端口、peers、会话数、最近一轮结果）
+- `dsh_sync_now`：立刻同步一轮
+- `dsh_sync_config`：在线改配置（例如 `{"deviceName":"laptop","token":"…","peers":[{"name":"desktop","url":"http://192.168.1.10:8789","token":"…"}]}`）
+
+## 发布到 GitHub / 插件市场
+
+见 [docs/PUBLISHING.md](docs/PUBLISHING.md)：仓库初始化、`package.json` 需要补的字段、`npm pack` 检查、版本与 tag、市场提交前自检清单。

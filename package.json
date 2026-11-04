@@ -4,6 +4,19 @@
   "private": true,
   "type": "module",
   "description": "跨设备同步 DSH 会话、附件与工作区索引：局域网点对点，或经一个 hub 服务器中转。",
+  "license": "MIT",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "sync",
+    "multi-device",
+    "lan",
+    "cordis"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",
