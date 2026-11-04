@@ -1,11 +1,17 @@
 import assert from 'node:assert'
 import fs from 'node:fs'
 import fsp from 'node:fs/promises'
-import os from 'node:os'
 import path from 'node:path'
 import crypto from 'node:crypto'
 import net from 'node:net'
+import http from 'node:http'
+import { fileURLToPath } from 'node:url'
 import { createEngine } from '../lib/engine.js'
+import { MAX_BLOB_BYTES, MAX_INDEX_BYTES, MAX_INDEX_ENTRIES, readFileLimited, requestBuffer, parsePeerIndex } from '../lib/limits.js'
+import { createStore } from '../lib/store.js'
+import { createSyncServer, listen, closeServer } from '../lib/server.js'
+
+const tmpRoot = fileURLToPath(new URL('./.tmp/', import.meta.url))
 
 const sha1 = (buf) => crypto.createHash('sha1').update(buf).digest('hex')
 
@@ -46,19 +52,28 @@ const SESS_A = 'sessions/projX/sess-aaa/session.v4.jsonl.zstd'
 const SESS_B = 'sessions/projY/sess-bbb/session.v4.jsonl.zstd'
 const ATT_A = 'attachments/img.bin'
 
-const contentA1 = Buffer.from('session A v1 — hello from device A\n'.repeat(40))
-const contentB1 = Buffer.from('session B v1 — hello from device B\n'.repeat(40))
-const contentA2 = Buffer.from('session A v2 — edited on A\n'.repeat(40))
-const contentB2 = Buffer.from('session B v2 — edited on B\n'.repeat(40))
+// 合法的 zstd 单段 raw-block frame，无需依赖压缩库，Node 20 同样可生成。
+function sessionFixture(text) {
+  const data = Buffer.from(JSON.stringify({ text }) + '\n')
+  assert.ok(data.length < 256)
+  const block = Buffer.alloc(3)
+  block.writeUIntLE((data.length << 3) | 1, 0, 3)
+  return Buffer.concat([Buffer.from([0x28, 0xb5, 0x2f, 0xfd, 0x20, data.length]), block, data])
+}
+const contentA1 = sessionFixture('session A v1 — hello from device A')
+const contentB1 = sessionFixture('session B v1 — hello from device B')
+const contentA2 = sessionFixture('session A v2 — edited on A')
+const contentB2 = sessionFixture('session B v2 — edited on B')
 
 function wsFor(sessionId, title, updatedAt) {
   return {
-    unit: 'default',
+    unit: { name: 'workspace', version: 2 },
     global: {
       workspaceIds: ['ws1'],
       archivedSessionIds: [],
       pinnedSessionIds: [],
       defaultWorkspaceId: 'ws1',
+      initialized: true,
     },
     tables: {
       workspaces: {
@@ -66,21 +81,225 @@ function wsFor(sessionId, title, updatedAt) {
           path: `/tmp/proj-${title.toLowerCase()}`,
           title,
           sessionIds: [sessionId],
-          createdAt: 1000,
-          updatedAt,
+          createdAt: new Date(1000).toISOString(),
+          updatedAt: new Date(updatedAt).toISOString(),
         },
       },
     },
   }
 }
 
+// 模拟宿主已打开 domain；测试读写均局限内存，宿主文件仅作只读哨兵。
+function mockDomain(initial) {
+  let value = structuredClone(initial)
+  const table = {
+    get: (id) => structuredClone(value.tables.workspaces[id]),
+    entries: () => Object.entries(structuredClone(value.tables.workspaces))[Symbol.iterator](),
+    get size() { return Object.keys(value.tables.workspaces).length },
+    async put(id, entry) { value.tables.workspaces = Object.fromEntries([...Object.entries(value.tables.workspaces).filter(([key]) => key !== id), [id, structuredClone(entry)]]) },
+  }
+  return {
+    name: 'workspace',
+    global: { get: () => structuredClone(value.global), async set(global) { value.global = structuredClone(global) } },
+    table: (name) => { assert.strictEqual(name, 'workspaces'); return table },
+    document: () => structuredClone(value),
+  }
+}
+
+async function testStateRecovery() {
+  const home = await fsp.mkdtemp(path.join(tmpRoot, 'state-recovery-'))
+  const rel = SESS_A
+  let remoteContent = contentB1
+  const peer = createSyncServer({
+    token: () => TOKEN, getDevice: () => 'remote', getRole: () => 'peer', getVersion: () => 'test',
+    getIndex: async () => ({ [rel]: { sha1: sha1(remoteContent), size: remoteContent.length } }),
+    getBlob: async () => remoteContent, putBlob: async () => {},
+  })
+  const port = await listen(peer, 0, '127.0.0.1')
+  try {
+    for (const stateBytes of [undefined, '{broken JSON', 'null', '{"localHashes":null,"remoteHashes":[]}']) {
+      await writeFileRel(home, rel, contentA1)
+      backdate(path.join(home, rel))
+      await writeFileRel(home, 'storages/workspace.json', JSON.stringify(wsFor('sess-aaa', 'Local', 2000)))
+      const stateFile = path.join(home, 'plugin-sync/state.json')
+      if (stateBytes === undefined) await fsp.rm(stateFile, { force: true })
+      else await writeFileRel(home, 'plugin-sync/state.json', stateBytes)
+      remoteContent = contentB1
+      const domain = mockDomain(wsFor('sess-aaa', 'Local', 2000))
+      const makeEngine = () => createEngine({ getWorkspaceDomain: () => domain, rowConfig: {
+        dshHome: home, deviceName: 'state-test', listenPort: 0, token: TOKEN, settleSec: 0,
+        peers: [{ name: 'remote', url: `http://127.0.0.1:${port}`, token: TOKEN }],
+      } })
+      let engine = makeEngine()
+      try {
+        await engine.init()
+        const before = (await listConflicts(home, '')).length
+        const result = await engine.runCycle()
+        assert.deepStrictEqual(result.errors, [], `state=${stateBytes} 安全恢复`)
+        assert.deepStrictEqual(await fsp.readFile(path.join(home, rel)), contentA1, '无基线保留本地')
+        assert.strictEqual(result.conflicts, 1, '远端存冲突副本')
+        assert.strictEqual((await listConflicts(home, '')).length, before + 1)
+        const saved = JSON.parse(await fsp.readFile(stateFile, 'utf8'))
+        assert.strictEqual(saved.unresolvedConflict[rel].localSha, sha1(contentA1))
+        assert.strictEqual(saved.unresolvedConflict[rel].remoteSha, sha1(contentB1))
+        await engine.close()
+        remoteContent = contentB2
+        engine = makeEngine()
+        await engine.init()
+        const changed = await engine.runCycle()
+        assert.deepStrictEqual(changed.errors, [], '重启后远端再次变化无落回错误')
+        assert.deepStrictEqual(await fsp.readFile(path.join(home, rel)), contentA1, '持久未解决冲突禁止下轮覆盖')
+        const unresolved = JSON.parse(await fsp.readFile(stateFile, 'utf8')).unresolvedConflict[rel]
+        assert.ok(unresolved, '远端变化后未解决标记仍存在')
+      } finally {
+        await engine.close()
+      }
+    }
+    console.log('state 缺失/损坏/错误结构 → 持久冲突 → 重启后远端变化仍保留本地 PASS')
+  } finally {
+    await closeServer(peer)
+    await fsp.rm(home, { recursive: true, force: true })
+  }
+}
+
+async function testResourceLimitsAndErrors() {
+  const home = await fsp.mkdtemp(path.join(tmpRoot, 'resource-limits-'))
+  let indexBytes = Buffer.from('{"files":{}}')
+  let declaredIndexSize = null
+  let blobGets = 0
+  const peer = http.createServer((req, res) => {
+    if (req.url === '/slow') {
+      res.writeHead(200)
+      res.write('start')
+      return // headers 已返回，body 永不完成，必须由客户端超时终止
+    }
+    if (req.url === '/chunked') {
+      res.writeHead(200)
+      res.write(Buffer.alloc(700))
+      return res.end(Buffer.alloc(700))
+    }
+    if (req.url === '/bigblob' || req.url.startsWith('/v1/blob/') && req.method === 'GET') {
+      blobGets++
+      res.writeHead(200, { 'content-length': MAX_BLOB_BYTES + 1 })
+      return res.flushHeaders()
+    }
+    if (req.url === '/v1/index') {
+      if (declaredIndexSize !== null) {
+        res.writeHead(200, { 'content-length': declaredIndexSize })
+        return res.flushHeaders()
+      }
+      return res.end(indexBytes)
+    }
+    req.resume()
+    req.on('end', () => res.end('{"ok":true}'))
+  })
+  const port = await listen(peer, 0, '127.0.0.1')
+  const url = `http://127.0.0.1:${port}`
+  let engine
+  try {
+    await assert.rejects(requestBuffer(url + '/slow', {}, { timeoutMs: 80 }), /超时|abort/i, '响应体超时也中断')
+    await assert.rejects(requestBuffer(url + '/chunked', {}, { maxBytes: 1024 }), /上限/, '无 Content-Length 时逐块限制')
+    await assert.rejects(requestBuffer(url + '/bigblob'), /上限/, 'blob >200MB 根据响应头提前拒收')
+    const sparse = await writeFileRel(home, 'oversized-blob', '')
+    await fsp.truncate(sparse, MAX_BLOB_BYTES + 1)
+    await assert.rejects(readFileLimited(sparse), /上限/, '本地稀疏文件超过200MB拒读')
+    const store = createStore(home)
+    const digest = 'a'.repeat(40)
+    await fsp.mkdir(path.dirname(store.blobPath(digest)), { recursive: true })
+    await fsp.copyFile(sparse, store.blobPath(digest))
+    await assert.rejects(store.getBlob(digest), /上限/, '缓存 blob 同样拒读')
+    await writeFileRel(home, 'staging/large', '')
+    await fsp.truncate(path.join(home, 'staging/large'), MAX_BLOB_BYTES + 1)
+    await assert.rejects(store.buildIndex(path.join(home, 'staging')), /上限/, '构建索引前拒绝超限blob')
+
+    const info = { sha1: digest, size: 1 }
+    const many = Object.fromEntries(Array.from({ length: MAX_INDEX_ENTRIES + 1 }, (_, i) => [`f${i}`, info]))
+    const oversizedEntries = Buffer.from(JSON.stringify({ files: many }))
+    assert.ok(oversizedEntries.length < MAX_INDEX_BYTES)
+    assert.throws(() => parsePeerIndex(oversizedEntries), /100000/, '单peer超过100000条拒收')
+    assert.throws(() => parsePeerIndex(Buffer.alloc(MAX_INDEX_BYTES + 1)), /上限/, 'index超过16MB拒绝解析')
+    assert.deepStrictEqual(parsePeerIndex(Buffer.from('{"files":{}}')), { files: {} })
+
+    await writeFileRel(home, 'storages/workspace.json', JSON.stringify(wsFor('sess-aaa', 'Local', 2000)))
+    engine = createEngine({ rowConfig: { dshHome: home, listenPort: 0, token: TOKEN, peers: [{ name: 'bad-peer', url }] } })
+    await engine.init()
+    for (const scenario of ['entries', 'index-bytes', 'blob-metadata', 'blob-body']) {
+      declaredIndexSize = scenario === 'index-bytes' ? MAX_INDEX_BYTES + 1 : null
+      indexBytes = scenario === 'entries' ? oversizedEntries : Buffer.from(JSON.stringify({ files: {
+        'attachments/remote.bin': { sha1: digest, size: scenario === 'blob-metadata' ? MAX_BLOB_BYTES + 1 : 1 },
+      } }))
+      const before = blobGets
+      const result = await engine.runCycle()
+      assert.ok(result.errors.some((e) => e.includes('peer bad-peer:') && /上限|不合法/.test(e)), `${scenario} 进入cycle.errors`)
+      if (scenario !== 'blob-body') assert.strictEqual(blobGets, before, '整个坏peer在blob读取前被跳过')
+      await assert.rejects(fsp.access(path.join(home, 'attachments/remote.bin')), '超限blob没有落回')
+    }
+    declaredIndexSize = null
+    indexBytes = Buffer.from('{"files":{}}')
+    await writeFileRel(home, 'storages/workspace.json', '{broken')
+    const rejected = await engine.runCycle()
+    assert.ok(rejected.errors.some((e) => e.includes('JSON 解析失败')), 'N1 首次合并拒写 error 汇总')
+    await writeFileRel(home, 'storages/workspace.json', JSON.stringify(wsFor('sess-aaa', 'Local', 2000)))
+    const remote = wsFor('sess-remote', 'Remote', 3000)
+    remote.global.workspaceIds.push('broken-entry')
+    remote.tables.workspaces['broken-entry'] = null
+    const remoteBytes = Buffer.from(JSON.stringify(remote))
+    indexBytes = Buffer.from(JSON.stringify({ files: {
+      'workspace/workspace.json': { sha1: sha1(remoteBytes), size: remoteBytes.length },
+    } }))
+    // 此次远端 workspace body 是合法JSON，坏条目应报告而不是让整个复检崩溃。
+    const serveWorkspace = (req, res) => {
+      if (req.method === 'GET' && req.url.startsWith('/v1/blob/')) res.end(remoteBytes)
+      else if (req.url === '/v1/index') res.end(indexBytes)
+      else { req.resume(); req.on('end', () => res.end('{"ok":true}')) }
+    }
+    peer.removeAllListeners('request')
+    peer.on('request', serveWorkspace)
+    const merged = await engine.runCycle()
+    assert.ok(merged.errors.some((e) => e.includes('broken-entry')), 'N1 第二次合并 errors 数组汇总')
+    console.log('B9 响应体超时/200MB/16MB/100000条 + N1 cycle错误汇总 PASS')
+  } finally {
+    await engine?.close()
+    peer.closeAllConnections()
+    await closeServer(peer)
+    await fsp.rm(home, { recursive: true, force: true })
+  }
+}
+
+async function testServerBodyLimit() {
+  let stored = false
+  const server = createSyncServer({
+    token: () => TOKEN, putBlob: async () => { stored = true },
+  })
+  const port = await listen(server, 0, '127.0.0.1')
+  try {
+    const status = await new Promise((resolve, reject) => {
+      const req = http.request({ hostname: '127.0.0.1', port, path: '/v1/blob/' + 'a'.repeat(40), method: 'PUT', headers: {
+        'x-dsh-sync-token': TOKEN, 'content-length': MAX_BLOB_BYTES + 1,
+      } }, (res) => { res.resume(); resolve(res.statusCode) })
+      req.on('error', reject)
+      req.flushHeaders()
+    })
+    assert.strictEqual(status, 413, '服务端200MB请求体上限')
+    assert.strictEqual(stored, false)
+    console.log('服务端超限请求体拒收 PASS')
+  } finally {
+    server.closeAllConnections()
+    await closeServer(server)
+  }
+}
+
 async function main() {
-  const homeA = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-sync-a-'))
-  const homeB = await fsp.mkdtemp(path.join(os.tmpdir(), 'dsh-sync-b-'))
+  await fsp.mkdir(tmpRoot, { recursive: true })
   const portA = await freePort()
   const portB = await freePort()
+  const homeA = await fsp.mkdtemp(path.join(tmpRoot, 'dsh-sync-a-'))
+  const homeB = await fsp.mkdtemp(path.join(tmpRoot, 'dsh-sync-b-'))
 
+  const domainA = mockDomain(wsFor('sess-aaa', 'ProjX', 2000))
+  const domainB = mockDomain(wsFor('sess-bbb', 'ProjY', 2500))
   const engineA = createEngine({
+    getWorkspaceDomain: () => domainA,
     rowConfig: {
       deviceName: 'A',
       role: 'peer',
@@ -93,6 +312,7 @@ async function main() {
     },
   })
   const engineB = createEngine({
+    getWorkspaceDomain: () => domainB,
     rowConfig: {
       deviceName: 'B',
       role: 'peer',
@@ -114,6 +334,8 @@ async function main() {
     const statusA = await engineA.status()
     assert.strictEqual(statusA.token, 'test-t' + '******', 'token 打码')
     assert.strictEqual(statusA.device, 'A')
+    assert.strictEqual(statusA.workspaceWriteMode, 'domain')
+    assert.strictEqual(statusA.proposalPending, false)
 
     // ---------- 1. 初始同步：A 的会话/附件/workspaces 送到 B，workspace sessionIds 并集 ----------
     await writeFileRel(homeA, SESS_A, contentA1)
@@ -136,7 +358,7 @@ async function main() {
     const gotAttB = await fsp.readFile(path.join(homeB, ATT_A))
     assert.strictEqual(sha1(gotAttB), sha1(Buffer.from('attachment-bytes-A')), 'B 收到附件')
 
-    const wsB = JSON.parse(await fsp.readFile(path.join(homeB, 'storages', 'workspace.json'), 'utf8'))
+    const wsB = domainB.document()
     assert.deepStrictEqual(
       [...wsB.tables.workspaces.ws1.sessionIds].sort(),
       ['sess-aaa', 'sess-bbb'],
@@ -148,7 +370,7 @@ async function main() {
     assert.deepStrictEqual(rA2.errors, [], 'A 第二轮无错误')
     const gotSessA = await fsp.readFile(path.join(homeA, SESS_B))
     assert.strictEqual(sha1(gotSessA), sha1(contentB1), 'A 收到 B 的会话')
-    const wsA = JSON.parse(await fsp.readFile(path.join(homeA, 'storages', 'workspace.json'), 'utf8'))
+    const wsA = domainA.document()
     assert.deepStrictEqual(
       [...wsA.tables.workspaces.ws1.sessionIds].sort(),
       ['sess-aaa', 'sess-bbb'],
@@ -201,6 +423,19 @@ async function main() {
     assert.strictEqual(sha1(await fsp.readFile(path.join(homeA, SESS_A))), sha1(contentA2), 'A 本地 sha1 仍不变')
     assert.strictEqual(sha1(await fsp.readFile(path.join(homeB, SESS_A))), sha1(contentB2), 'B 本地 sha1 仍不变')
 
+    assert.deepStrictEqual(
+      JSON.parse(await fsp.readFile(path.join(homeA, 'storages/workspace.json'), 'utf8')),
+      wsFor('sess-aaa', 'ProjX', 2000),
+      'domain模式从未改宿主文件哨兵A',
+    )
+    assert.deepStrictEqual(
+      JSON.parse(await fsp.readFile(path.join(homeB, 'storages/workspace.json'), 'utf8')),
+      wsFor('sess-bbb', 'ProjY', 2500),
+      'domain模式从未改宿主文件哨兵B',
+    )
+    await testStateRecovery()
+    await testResourceLimitsAndErrors()
+    await testServerBodyLimit()
     console.log('ALL PASS')
   } finally {
     await engineA.close()

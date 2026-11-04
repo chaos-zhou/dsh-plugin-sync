@@ -6,7 +6,23 @@ import { publicSettings } from './lib/config.js'
 export const inject = ['tools']
 
 export function apply(ctx, config) {
-  const engine = createEngine({ rowConfig: config || {} })
+  // 可选服务独立注入：宿主未提供或稍后卸载时，工具仍可用并退回建议文件模式。
+  let storageDomain
+  try {
+    ctx.inject?.(['storageDomain'], (dctx) => {
+      const service = dctx.storageDomain
+      storageDomain = service
+      dctx.effect?.(() => () => {
+        if (storageDomain === service) storageDomain = undefined
+      })
+    })
+  } catch {
+    storageDomain = undefined
+  }
+  const engine = createEngine({
+    rowConfig: config || {},
+    getWorkspaceDomain: () => storageDomain?.get('workspace'),
+  })
   const ready = engine.init().catch((e) => {
     // 不能抛到宿主：尽力写入日志文件
     const dir = path.join(engine.dataDir || '', 'logs')
