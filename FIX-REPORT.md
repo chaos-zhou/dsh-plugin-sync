@@ -352,3 +352,18 @@ grep 自检（实测）：
 3. **宿主 no-op 语义依赖契约**：attach/archive/pin 的幂等仍依赖宿主「重复调用无害」承诺（v1.2 遗留，不变）。
 4. **stat 与宿主识别的时差 / archiveSession 不强停 / registryLastApplied 进程内存活 / 未做跨工作区移动**：均沿袭 v1.2，见上一节。
 5. **交 Codex 复审与 PM 实机验证尚未执行**：重载插件后需观察 `workspaceWriteMode:'registry'` 且对端会话出现在本机工作区（宿主自行落盘），见 ACCEPTANCE.md。
+
+
+---
+
+# v1.3.0：pathRemap 收敛为「应用时映射一次」
+
+## 背景
+v1.2.3-v1.2.5 尝试在合并阶段映射派生文档，被 Codex 连续指出：单规则可幂等但整组规则链式叠加、字符串边界（尾斜线/./..）可绕过、派生文档自愈会误删合法条目。
+
+## 方案
+合并阶段完全不映射；`mergeWorkspace` 保留远端原始路径到 proposal/staging。`lib/workspace.js` 新增 `normalizeRemapRules`（绝对路径、无点段、去重）与 `mapPathOnce`（规则按顺序组合、单次应用）；`lib/registry-apply.js` 在使用 `ws.path` 前调用一次，非法规则则整组禁用并跳过该工作区；`lib/engine.js` 把 `settings.pathRemap` 传给 applier 而不是 merge。
+
+## 验证
+- registry.test.mjs 新增：applier 映射两轮稳定、合并阶段保留原路径、非法规则零 mutation、链式规则单次应用稳定。
+- 全 seven suites exit 0。

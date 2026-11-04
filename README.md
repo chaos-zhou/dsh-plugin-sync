@@ -247,3 +247,12 @@ node tests/registry.test.mjs          # v1.2 registry 应用：12 组场景（�
 ## 发布到 GitHub / 插件市场
 
 见 [docs/PUBLISHING.md](docs/PUBLISHING.md)：仓库初始化、`package.json` 需要补的字段、`npm pack` 检查、版本与 tag、市场提交前自检清单。
+
+## v1.3.0：路径映射只在应用时做一次
+
+`pathRemap` 不再参与合并，也不再写入 proposal/staging；它只在 registry applier 真正使用远端工作区路径的那一刻应用一次：
+
+- 规则要求：`from`/`to` 必须是绝对路径，不能包含 `.`/`..` 段；空规则与 `from === to` 会被忽略；同一 `(from,to)` 去重。
+- 规则按配置顺序在**单次调用**内组合（可写链式，如 `/a→/b`、`/b→/c`），每轮从原始路径重新计算，因此不存在“已经映射过再映射”的膨胀问题。
+- 规则或路径非法时：整组映射禁用、warning 可见、当前工作区跳过（不再猜测路径）。
+- 派生文档（`staging/`、`proposed/`）保留远端原始路径；它们只是审计/缓存，不是最终路径来源。
