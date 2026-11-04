@@ -5,6 +5,8 @@ DSH 多端同步插件：在两台（或多台）安装了 DSH 的设备之间�
 > **v1.1 行为变化**：工作区索引不再写宿主 `storages/workspace.json`，也不再使用宿主 `storageDomain` 服务——合并结果只生成建议文件，等待宿主事务 API 或人工应用。会话/附件/摘要缓存自动同步不受影响，详见「工作区索引写入模式」。
 >
 > **v1.1.1 安全收口**：新增统一写防护层 `lib/safe-writer.js`，插件所有落盘路径（含日志、state、blob）都经过符号链接/边界校验；`<dshHome>/storages` 本身为符号链接时判定危险配置并拒绝一切写入。详见「路径边界防护」。
+>
+> **v1.1.2 安全补强**：日志追加/轮转增加硬链接防护（目标 `nlink>1` 拒绝，打开后 `fstat` 复核），日志拒绝不再静默而是计入本轮 `errors[]`；目录创建收敛到 `guardedMkdir`（`plugin-sync` 或 `storages` 被符号链接劫持时初始化零创建）；safe-writer 全部内部异常转为结构化拒绝。同时如实声明防护能力边界（`O_NOFOLLOW` 只保护最后一级、校验与 `rename` 之间存在 TOCTOU 窗口），详见「路径边界防护」。
 
 ## 安装
 
@@ -107,7 +109,7 @@ hub 只做字节中转（`/v1/ping`、`/v1/index`、`/v1/blob`），不解析 DS
 | 插件配置 | `profiles/*/cordis.patch.yml` | `config/<profile>/cordis.patch.yml`（保留导出，暂停自动写回） |
 | 工作区索引 | 只读参考宿主 `storages/workspace.json` | `workspace/workspace.json`（无损合并，只生成建议，不写宿主） |
 
-**从不传输**：`plugin-sync/`（自身数据）、`node_modules/`、`electron/`、`speech-to-text/`、`cache/`、`llm-deepseek/`、`.credentials.yaml`、`.anonymous-user-id`、所有 `*.lock` 文件。所有落盘统一经 `lib/safe-writer.js`：先以 `O_CREAT|O_EXCL|O_NOFOLLOW` 创建 `.tmp-<basename>.<pid>.<rand>` 临时文件，再原子 rename 到目标，对端不会读到半个文件。
+**从不传输**：`plugin-sync/`（自身数据）、`node_modules/`、`electron/`、`speech-to-text/`、`cache/`、`llm-deepseek/`、`.credentials.yaml`、`.anonymous-user-id`、所有 `*.lock` 文件。已知落盘统一经 `lib/safe-writer.js`（含目录创建与日志，见「路径边界防护」）：先以 `O_CREAT|O_EXCL|O_NOFOLLOW` 创建 `.tmp-<basename>.<pid>.<rand>` 临时文件，再原子 rename 到目标，对端不会读到半个文件。
 
 ## 冲突与“同一会话只在一台继续”
 
@@ -138,15 +140,19 @@ v1.1 起**只有 proposal 模式**：插件绝不写宿主 `storages/workspace.j
 | 写入 | `<dataDir>/proposed/workspace.json` 与 `<dataDir>/staging/workspace/workspace.json`，经 `lib/safe-writer.js` 先写 `O_NOFOLLOW` 独占临时文件再原子 rename |
 | 状态 | `workspaceWriteMode: 'proposal'`（恒定）、`proposalPending`、`proposalPath`、`proposalPathSafe`，建议持续保留并在每轮 `warnings[]` 提示 |
 
-**路径边界防护（v1.1.1，统一 safe-writer）**：插件**全部**落盘路径（proposal、staging、日志、state.json、config.json、blob、会话/附件/摘要缓存落回）都收敛到 `lib/safe-writer.js` 的统一防护层，不再有绕过路径：
+**路径边界防护（v1.1.2，统一 safe-writer）**：插件的已知落盘路径（proposal、staging、日志、state.json、config.json、blob、目录创建、会话/附件/摘要缓存落回）都收敛到 `lib/safe-writer.js` 的统一防护层（仓库内有 grep 自检佐证，见 FIX-REPORT）：
 
-1. **数据目录边界**：init 时 `assertSafeRoot(dataDir)` 校验插件数据目录本身不在宿主 `storages/` 内；若 `<dshHome>/storages` 本身是符号链接（含悬空），判定为危险配置，**拒绝一切写入**（config 播种、日志、proposal、state 全部拒绝），错误计入 `errors[]`。
-2. **祖先链校验**：每次写入从文件系统根逐级 `lstat` 走到目标父目录，任何一级是符号链接即拒绝；父目录按需逐级 `mkdir` 并在创建后 `realpath` 复核仍在 root 之内。
-3. **目标文件校验**：目标已存在且是符号链接（含悬空）→ 拒绝；临时文件以 `O_CREAT|O_EXCL|O_NOFOLLOW` 创建，不跟随任何链接；rename 之后 `lstat`+`realpath` 复核目标是普通文件且解析后仍位于 root 内。
-4. **本轮拒绝缓存**：同一轮 cycle 内被拒绝的写目标不再重试（错误含「不再重试」），避免逐 peer 重复试探；直接调用（如测试）使用独立 round 键，修复文件系统后可重试。
-5. **落回专属禁点**：`assertApplyTarget` 对会话/附件落回额外检查父级符号链接；摘要缓存合法写入 `storages/session_projcache/sessions/`，但父目录不得是符号链接、目标不得解析为 `storages/workspace.json`。
+1. **数据目录边界**：init 时 `assertSafeRoot(dataDir)` 校验插件数据目录本身不在宿主 `storages/` 内；若 `<dshHome>/storages` 本身是符号链接（含悬空），判定为危险配置，**拒绝一切写入与目录创建**（config 播种、日志、proposal、state 全部拒绝），错误计入 `errors[]`。
+2. **目录创建（`guardedMkdir`）**：插件所有目录创建统一走 `guardedMkdir`——创建前校验最近已存在祖先的真实目录链（任何一级是符号链接即拒绝，包括 `plugin-sync` 本身被劫持），`storages` 为符号链接/悬空别名时拒绝创建（别名不会被初始化激活）；逐级创建后 `realpath` 复核仍在合法范围内。
+3. **祖先链校验**：每次写入从文件系统根逐级 `lstat` 走到目标父目录，任何一级是符号链接即拒绝；缺失父目录逐级创建并在创建后 `realpath` 复核仍在 root 之内。
+4. **目标文件校验**：目标已存在且是符号链接（含悬空）→ 拒绝；临时文件以 `O_CREAT|O_EXCL|O_NOFOLLOW` 创建；rename 之后 `lstat`+`realpath` 复核目标是普通文件且解析后仍位于 root 内。注意：`O_NOFOLLOW` 只保护**打开时的最后一级路径组件**，不防护父目录链。
+5. **硬链接防护（v1.1.2）**：日志追加（`guardedAppend`）与轮转（`guardedRotate`）在操作前 `lstat` 拒绝 `nlink>1` 的目标（防止 `sync.log` 是宿主 `storages/workspace.json` 的硬链接时，追加/轮转直接修改宿主同一 inode）；打开后再次 `fstat` 复核 `nlink===1`，防「校验后、打开前」被替换为硬链接的窗口。
+6. **本轮拒绝缓存**：同一轮 cycle 内被拒绝的写目标（含日志目标）不再重试（错误含「不再重试」），避免逐 peer 重复试探；直接调用（如测试）使用独立 round 键，修复文件系统后可重试。
+7. **落回专属禁点**：`assertApplyTarget` 对会话/附件落回额外检查父级符号链接；摘要缓存合法写入 `storages/session_projcache/sessions/`，但父目录不得是符号链接、目标不得解析为 `storages/workspace.json`。
 
-写入失败返回结构化错误（含失败原因），计入本轮 `errors[]`；**proposal 目标**被拒时置 `proposalPathSafe: false`，staging 副本被拒不影响该标志；拒绝路径不产生任何文件（临时文件已清理）。`tests/security.symlink.test.mjs` 用 `tests/.tmp` 里的真实符号链接构造了七类攻击（staging/workspace→storages、悬空 storages 别名、sync.log→宿主 workspace.json、staging 目标为文件链接、附件父级链接等）并断言宿主字节不变、零写系统调用。
+**失败契约与拒绝语义（如实）**：safe-writer 的任何内部异常（`realpath`/`lstat`/`stat` 的 EACCES/EIO/ELOOP 等）都捕获并转为结构化拒绝 `{ok:false, code, error}`，不向调用方抛出、不在失败后同轮重试；写后父目录 `realpath` 失败/无法确认边界时按**失败**返回（内容可能已落盘，以返回的错误为准）。被拒绝的目标（符号链接/硬链接/越界/危险配置）不会创建或修改文件，临时文件已清理；I/O 中途失败则可能留下已创建的目标或部分内容。写入失败计入本轮 `errors[]`；**日志与日志轮转被拒绝时不再静默**，同样计入 `errors[]`；**proposal 目标**被拒时置 `proposalPathSafe: false`，staging 副本被拒不影响该标志。
+
+**残余风险（TOCTOU 窗口，如实声明）**：`lstat`/`realpath` 校验与最终 `rename`/追加之间存在理论竞态窗口——攻击者若能在校验通过后的瞬间替换中间目录或目标，防护可能被绕过；写后复核只能**发现**该窗口内的替换并报错，不能阻止或回滚宿主侧的并发改动。彻底消除需要 openat2/RESOLVE_BENEATH 级内核支持，Node 无对应 API。`tests/security.symlink.test.mjs` 用 `tests/.tmp` 里的真实符号链接/硬链接构造了 14 组攻击（staging/workspace→storages、悬空 storages 别名、sync.log→宿主 workspace.json 符号链接与硬链接、staging 根为链接、plugin-sync→storages 初始化污染、lstat/realpath 故障注入等），并断言宿主字节不变、零写系统调用。
 
 合并规则（与写入模式无关，始终适用）：
 
@@ -166,7 +172,7 @@ v1.1 起**只有 proposal 模式**：插件绝不写宿主 `storages/workspace.j
 
 ## 日志与排查
 
-- 追加日志：`<dshHome>/plugin-sync/logs/sync.log`，超过 2MB 轮转为 `sync.log.1`。
+- 追加日志：`<dshHome>/plugin-sync/logs/sync.log`，超过 2MB 轮转为 `sync.log.1`。日志文件本身被符号链接/硬链接劫持、或 `storages` 为危险配置时，追加与轮转被 safe-writer 拒绝，拒绝信息计入本轮 `errors[]`（不再静默）。
 - 单个 peer 失败不影响其他 peer，错误会进本轮摘要的 `errors[]` 并写日志；整个 cycle 的任何异常都被捕获，不会抛到宿主。
 - 常见问题：
   - **连不上**：确认双方 token 一致、`listenPort` 没被防火墙拦截、`peers[].url` 用对方的局域网 IP；
@@ -183,7 +189,7 @@ node tests/workspace.compat.test.mjs  # 无损合并、校验/容量拒写、真
 node tests/apply.compat.test.mjs      # 跨周期冲突保护、坏zstd/JSONL、缓存校验、配置拒绝自动落回
 node tests/engine.offline.test.mjs    # 沙箱补充：真实文件与周期，内存 fetch 响应，不能代替 HTTP 验收
 node tests/fixture.accept.test.mjs    # 读取 /tmp/dsh-sync-accept 两份事故 fixture，在仓库临时目录合并
-node tests/security.symlink.test.mjs  # 七类真实符号链接攻击 + 完整 runCycle：宿主字节不变、零写系统调用
+node tests/security.symlink.test.mjs  # 14 组攻击：符号链接/硬链接/目录污染/故障注入，宿主字节不变、零写系统调用
 ```
 
 各测试成功均输出 `ALL PASS`；HTTP 测试需要允许本机端口监听。

@@ -205,3 +205,56 @@ v4 决策：**v1.1 起插件完全不写宿主工作区索引**，`workspaceWrit
 4. 无原生 zstd 解压能力的 Node（如 20.x）会话自动落回保守拒绝（推送/拉取到 staging 不受影响）；需 Node ≥ 22.15/23.8+。
 5. proposal 依赖宿主事务 API 或人工应用；`rejectedTargets` 为进程内 WeakMap，重启后同轮语义重置（属预期，round 本就以 cycle 为界）。
 6. 「交 Codex 第五轮审核」尚未执行，送审前待 PM 安排。
+
+---
+
+# Claude Code 本轮（v6 硬链接与失败契约收口）
+
+日期：2026-11-04。环境：Node.js v24.15.0，macOS（本机端口监听可用）。
+
+依据 FIX-SPEC-v6 完成 H1–H5（Codex 第五轮终审：仅剩 1 个 BLOCKER「日志硬链接可破坏宿主索引」+ 4 条 NIT）。版本 `1.1.2`。
+
+## 对 v5 章节两处过强结论的更正（S4）
+
+1. **「失败统一返回结构化错误不抛出」不符**：v5 的 `assertSafeRoot`/`ensureParentsUnderRoot`/`ensureExistingDirChain` 内部的 `realpath` 调用可能直接抛出（EACCES/EIO 等）绕过拒绝登记；`guardedWrite` 写后父目录 `realpath` 失败被转成 `null` 后**仍返回成功**；`assertApplyTarget` 的两处 `realpath().catch(() => null)` 在解析失败时静默放行。v6 已全部修复（见 H2）。
+2. **「无任何调用以宿主 `storages/` 为目标」过强**：apply 摘要缓存落回 `storages/session_projcache/sessions/` 是合法写入目标（由 `assertApplyTarget` 管辖禁点）。准确表述应为：**无任何写调用以宿主 `storages/workspace.json` 为目标**——该路径全仓库仅 `lib/workspace.js` 与 `lib/export.js` 两处只读 `readWorkspaceStatus`。
+
+## 逐项修复（位置 → 测试 → 结果）
+
+测试列：安全 = `tests/security.symlink.test.mjs`（14 组），其余五个测试文件含义与 v5 相同。
+
+| 项目 | 位置与行为 | 测试 | 结果 |
+|---|---|---|---|
+| H1 硬链接防护 | `lib/safe-writer.js guardedAppend`：追加前 `lstat` 拒绝 `nlink>1`（code `hardlink`）；`O_WRONLY\|O_APPEND\|O_CREAT\|O_NOFOLLOW` 打开后 `handle.stat()`（fstat）复核 `nlink===1` 且为普通文件，不满足立即关闭并拒绝（防 TOCTOU）。`guardedRotate`：源文件 `nlink>1` 拒绝轮转（不得对多链接文件 rename）；轮转目标 `file+suffix` 若存在且为符号链接/硬链接/非普通文件同样拒绝。两者均接入 round 拒绝缓存（同轮不再重试）与整体 try/catch（内部异常转结构化拒绝）。`lib/log.js`：拒绝不再静默——记入 `logger.rejected`（去重、封顶 50 条，缓存型 `rejected` 消息不重复记录），`lib/engine.js runCycle` 每轮 `newRound()` 重置缓存、结束时 `drainRejected()` 并入 `cycle.errors[]`。 | 安全攻击11（真实 `fsp.link(宿主workspace.json → plugin-sync/logs/sync.log)` + 完整 init+runCycle：宿主原始字节不变、`nlink` 保持 2、`cycle.errors` 含「拒绝追加/硬链接」）；攻击12（源超过 2MiB 轮转阈值 + `nlink=2`：轮转拒绝、不产生 `sync.log.1`；轮转目标为硬链接同样拒绝）；攻击13（monkeypatch `fsp.lstat` 谎报 `nlink=1`：打开后 fstat 复核仍拒绝，宿主字节不变）；攻击3 更新（sync.log 符号链接时拒绝信息现在**可见**于 `cycle.errors`）。 | PASS |
+| H2 失败契约 | `lib/safe-writer.js`：`assertRealDirChain` 末尾 `realpath`、`ensureParentsUnderRoot` 新建目录 `realpath`、`ensureExistingDirChain` 逐级 `realpath` 全部 try/catch 转结构化拒绝；`guardedWrite` 写后父目录 `realpath` **失败即返回失败**（不再转 null 后当成功）；`assertApplyTarget` 两处 `realpath` 改为「ENOENT 跳过（父级由 guardedWrite 创建并复核）、其余错误一律结构化拒绝」；`guardedAppend`/`guardedRotate`/新增 `guardedMkdir` 整体 try/catch 兜底（任何内部异常不抛出到调用方）。拒绝登记统一：同轮同一目标只拒绝一次、记录首次原因（`cachedRejection` 措辞改为通用的「拒绝操作」）。 | 安全「故障注入」组：①目标 `lstat` 注入 EACCES → `guardedWrite`/`guardedAppend` 返回 `{ok:false, code:'io'}` 不抛出、零文件产生；②root `realpath` 注入 EACCES → `assertSafeRoot` 结构化拒绝；③rename 后注入父目录 `realpath` 失败 → `guardedWrite` 返回失败（错误含「写后复核」，无临时文件残留）；④`assertApplyTarget` 父目录 `realpath` 故障 → 结构化拒绝。 | PASS |
+| H3 目录创建入安全层 | 新增 `lib/safe-writer.js guardedMkdir(dir, {dshHome, round})`：复用 `ensureExistingDirChain`（最近已存在祖先的真实目录链校验、`storages` 符号链接即危险配置拒绝、逐级创建后 `realpath` 复核、新建目录落入 storages 拒绝），接入 round 缓存。替换全部未防护 `mkdir(recursive)`：`lib/engine.js init`（staging/store/blobs/conflicts/logs 四个目录串行 `guardedMkdir`，失败记 `插件目录创建被拒绝` 且不再抛出）；`lib/export.js:53`（stagingRoot，失败抛结构化错误中止导出）；`lib/store.js:31`（blobsDir，失败抛出）；`lib/util.js ensureDir` 收窄为仅 hub.mjs 独立工具使用并加注释。 | 安全攻击8（`plugin-sync` → 宿主 `storages` 符号链接：`assertNoWritesTo` 包裹 init 证明零写系统调用——**初始化不再先在宿主目录创建目录**，宿主字节与目录清单不变）；攻击9（悬空 `storages → plugin-sync/logs`：init 后 `plugin-sync` 与 `logs` 均不存在，别名未被激活）；攻击2 补强（危险配置下 logs 目录现在**根本不创建**，比 v5 更严格）。 | PASS |
+| H4 测试补齐 | `tests/security.symlink.test.mjs` 从 7 组扩到 14 组：攻击8 plugin-sync→storages 初始化污染、攻击9 悬空 storages→logs、攻击10 staging 根本身是符号链接（root 链接，init+runCycle 拒绝、dataDir 合法写入不受牵连）、攻击11 真实硬链接完整周期、攻击12 硬链接轮转（直调守卫）、攻击13 fstat 复核（lstat 欺骗注入）、故障注入组（lstat/realpath EACCES 四个子场景）；attack5 补 `finally` 清理（删符号链接与临时目录）；attack2/attack3 断言随 v6 行为更新（logs 目录零创建、日志拒绝入 errors）。六个测试文件保持全绿。 | 全部 14 组 + 既有五测试文件。 | PASS |
+| H5 文档收窄 | README：「路径边界防护」整节重写——删除「不再有绕过路径」「不跟随任何链接」等绝对表述；新增第 4 条如实声明 `O_NOFOLLOW` 只保护最后一级组件；新增「失败契约与拒绝语义」段（内部异常全部转结构化拒绝、写后复核失败按失败返回、被拒目标零文件、日志拒绝入 errors）与「残余风险」段（校验与 rename 之间的 TOCTOU 窗口只能发现不能阻止/回滚，需 openat2 级支持）；攻击数 7→14。测试表、日志排查节同步更新。本报告本章节即更正与 v6 记录。`package.json` 1.1.2。 | 文档核对。 | 完成 |
+
+## 验收命令与结果（实测）
+
+`node --check`：本轮改动的 6 个 `lib/*.js`（safe-writer/log/engine/store/export/util）+ `tests/security.symlink.test.mjs`，连同 `index.js` 与其余全部 `lib/*.js`、`hub.mjs` 共 14 个文件，全部 exit 0。
+
+| 命令 | 结果 |
+|---|---|
+| `node tests/workspace.compat.test.mjs` | exit 0，15 组 ALL PASS |
+| `node tests/apply.compat.test.mjs` | exit 0，ALL PASS |
+| `node tests/engine.offline.test.mjs` | exit 0，ALL PASS |
+| `node tests/fixture.accept.test.mjs` | exit 0，ALL PASS |
+| `node tests/security.symlink.test.mjs` | exit 0，14 组 ALL PASS（含硬链接/root链接/目录污染/故障注入新用例） |
+| `node tests/engine.test.mjs` | exit 0，ALL PASS（真实 HTTP 双节点全流程） |
+
+写入自检（grep，`lib/` 与 `index.js`，实测）：
+
+- 写/删/rename/copy/append/写模式 open 调用点全部位于 `lib/safe-writer.js` 内，唯一例外 `lib/limits.js:14 fsp.open(file, 'r')` 为只读；
+- `mkdir` 调用点仅剩 `lib/safe-writer.js` 内部两处（均在逐级校验后执行、创建后 `realpath` 复核）与 `lib/util.js:23 ensureDir`（仅 `hub.mjs` 独立工具使用，其数据目录与插件无关）；
+- `storages/workspace.json` 仅 2 处只读 `readWorkspaceStatus`（`lib/workspace.js:437`、`lib/export.js:108`），无任何写/删/rename/copy 以其为目标。
+
+## 遗留风险（如实声明）
+
+1. **TOCTOU 窗口（无法在本仓库内彻底消除）**：`lstat`/`realpath` 校验与最终 `rename`/追加之间仍有理论竞态；硬链接防护的「校验后、打开前」窗口由打开后 `fstat` 复核兜底，但「fstat 后、write 前」的极端窗口仍存在。写后复核只能发现、不能回滚宿主侧并发改动；彻底消除需 openat2/RESOLVE_BENEATH 级内核支持，Node 无对应 API。
+2. `tests/engine.test.mjs` 依赖环境放行本机端口监听；换环境重跑前不能视为永久通过。
+3. 无原生 zstd 解压能力的 Node（如 20.x）会话自动落回保守拒绝；需 Node ≥ 22.15/23.8+。
+4. proposal 依赖宿主事务 API 或人工应用；`rejectedTargets` 为进程内 WeakMap，重启后同轮语义重置（round 本就以 cycle 为界，属预期）。
+5. v6 起危险配置下初始化不再创建 `plugin-sync` 子目录（fail-closed，比 v5 更严格）；修复文件系统后需重启插件或等待下一轮目录守卫重试（round 以 cycle 为界，日志目标下一轮自动恢复尝试）。
+6. 「交 Codex 第六轮终审，无 BLOCKER 才允许启用」尚未执行，送审前待 PM 安排。
