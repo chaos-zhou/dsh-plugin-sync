@@ -57,3 +57,49 @@ done
 - 快照过期和特殊键故障注入由工作区 case14 / case12 使用独立真实临时文件验证，全部 PASS。
 
 README 已同步严格信封、引用校验、备份与冻结、快照保护、首次冲突保护、内容校验、配置暂停自动落回及资源上限说明。尚未解除的验收项仅为真实 HTTP 引擎测试的沙箱限制；本次未重新启用插件或修改任何真实 DSH 数据。
+
+---
+
+# Claude Code 本轮（v3）
+
+日期：2026-11-04。环境：Node.js v24.15.0，macOS 沙箱（本轮放行了本机端口监听）。
+
+接手 `11d84a9`（Codex 因额度中断的部分实现）。逐文件审查 `index.js`、`lib/`（apply/engine/export/limits/server/store/util/workspace）、5 个测试与 README 后逐条核对 FIX-SPEC-v3 的 W1–W6 与 B7/B8/B9：**代码部分已完成且符合规格，本轮未发现需要修改的代码**；Codex 中断点在更新报告之前。本轮补齐验收执行、写入自检与本章节，未改动 `lib/` 代码，未 git commit，未触碰真实 `~/.dsh`（测试均使用 `tests/.tmp` 临时目录）。
+
+## 逐项核对（位置 → 测试 → 结果）
+
+测试列中工作区指 `tests/workspace.compat.test.mjs`（14 组），apply 指 `tests/apply.compat.test.mjs`（37 项），离线指 `tests/engine.offline.test.mjs`（7 组）。
+
+| 项目 | 位置 | 测试 | 结果 |
+|---|---|---|---|
+| W1 移除直接文件写 | 旧文件事务（备份/恢复/rename/冻结）已从 `lib/workspace.js` 整体删除（grep 无 `WORKSPACE_WRITE_FROZEN`/`restoreWorkspaceFromBackup`/`pruneBackups` 残留）。宿主 `storages/workspace.json` 全仓库仅两处**只读**有界三态访问：`lib/workspace.js:384 readWorkspaceStatus`（proposal 参考输入，`:461`）、`lib/export.js:100`（降级导出参考）。`lib/apply.js:273` 跳过 `workspace/` 前缀；`lib/apply.js:16-41 canonicalRel/checkParents` 阻断绝对路径、点段、反斜线、NUL、父目录符号链接；`lib/util.js:30` atomicWrite 以 `wx` 独占创建临时文件防预置符号链接重定向。 | 工作区「proposal 降级原子写建议/staging，宿主从未打开写且原始字节不变」（劫持 `fsp.open/writeFile/rename/copyFile`：宿主文件仅以 `'r'` 打开、目标目录始终只有 `workspace.json`）；apply「attachments/../storages/workspace.json 不能绕过」等 4 个穿越/符号链接用例；`tests/engine.test.mjs` 结尾「domain模式从未改宿主文件哨兵A/B」。 | PASS |
+| W2 宿主事务写（主路径） | `index.js:12-25` 运行时可选注入 `ctx.inject(['storageDomain'], …)`（try/catch 拿不到不抛错，dispose 清理旧句柄）；`lib/engine.js:84-91` `getWorkspaceDomain/workspaceWriteMode`。合并输入：`lib/workspace.js:400-420 snapshotWorkspaceDomain`（`global.get()` + `table('workspaces').entries()`，序列化快照隔离宿主引用并做 32MiB/引用校验）。写回 `lib/workspace.js:490-499`：仅对变化/新增条目 `table.put`（`isDeepStrictEqual` 比较），最后 `global.set`；任一 `put/set` 抛错 → `lib/workspace.js:500-501` 返回 `domainWriteFailed`+error，不回滚已成功条目、不改文件；`lib/engine.js:318-329` 收到 `domainWriteFailed` 后停止本轮后续 domain 合并（后续 peer 拉取仍进行）。写前校验 `lib/workspace.js:475-489`：输入与产物 `serializeWorkspaceDoc`（32MiB）、本地递归键集不缩减、`validateWorkspaceDoc(requireEnvelope:true)`（必需字段、workspaceIds ⊆ 表、default 引用完整）。`workspaceWriteMode` 输出在 `lib/engine.js:293,465`。 | 工作区用例1（调用顺序 `[['put','ws'],['put','new'],['set']]`、幂等轮零调用）、用例5（put 中途失败保留已成功写入、停止后续 put/global/staging）、用例6（global.set 失败不回滚）、离线「W2 domain部分put成功/后续put失败/后续peer整轮停止domain写」、离线注入生命周期、`tests/engine.test.mjs` domain 模式并集与零错误。 | PASS |
+| W3 降级模式 | `lib/workspace.js:505-509`：无 domain 时合并结果 `atomicWrite` 到 `dataDir/proposed/workspace.json`（`serializeWorkspaceDoc` 已限 32MiB，超限在写入前抛错拒写），`proposalPending:true` + warnings 提示路径，**绝不写宿主文件**；`lib/engine.js:175-177,324-327,466-467` 在 `dsh_sync_status` 与每轮摘要输出 `proposalPending/proposalPath`；`lib/workspace.js:437-447,478` 既有建议经三态读取 + `requireEnvelope` 校验后并入下一轮合并（含远端输入），domain 恢复后合并成功才清除（`:504`）。README「工作区索引写入模式」说明降级行为。 | 工作区用例7（哨兵字节不变、proposal 与 staging 一致）、用例8（本地缺失仅完整合法远端可生成；domain 恢复后清除旧建议）、用例9（跨周期建议并集、坏建议拒写保留）、`tests/fixture.accept.test.mjs`（降级模式下宿主字节完全不变）、离线 proposal 生命周期。 | PASS |
+| W4-B7 跨周期冲突基线 | `lib/apply.js:152-156 rememberConflict` 记录 `unresolvedConflict[rel] = {sessionId, localSha, remoteSha}`；`lib/apply.js:197-207,222-225`：存在未解决标记时任何自动覆盖禁止——远端再变更只追加冲突副本并保持标记，本地内容回写 staging；解锁条件 `lib/apply.js:158-196`：staging 哈希与本地一致**且**本轮所有配置 peer 证实同一远端版本（`observedConvergence`）才清除。`lib/engine.js:33-54 normalizeState`：state.json 缺失/坏 JSON/null/坏结构一律安全恢复为空基线；`:433` 每轮持久化到 state.json。 | `tests/engine.test.mjs testStateRecovery`：4 种 state 变体 ×「首轮冲突 → 关停重启 → 远端再变更 → 本地仍不被覆盖、标记仍在」；离线「B7 state安全恢复/冲突持久化/重启后远端再变更仍保留本地」；apply `caseNoBaseline`、`casePartialBaselineAndFresh` 等。 | PASS |
+| W4-B8 坏 zstd/JSONL 不覆盖 | `lib/apply.js:62-120 checkZstdFrames`（帧魔数/描述符/块边界/窗口与声明输出上限，RFC 8878 §3.1 未完成帧防护）+ `:122-150 sessionContentError`（非空 + 魔数 + `zlib.zstdDecompressSync({maxOutputLength})` 有界解压 + fatal UTF-8 + 逐行 `JSON.parse`）；运行时无 `zstdDecompressSync` → 同类文件一律保守拒写。校验失败 `:172-181` → 冲突副本 + `declined`，绝不覆盖本地；同一坏哈希不重复产生副本。摘要缓存 `:289-293` `JSON.parse` 校验后落回真实 `storages/session_projcache/sessions/`；`applyConfig` `:268` 永不自动落回（仅 warn）。 | apply 37 项中 20+ 项 B8 用例：「带正确魔数的坏zstd帧」「帧被截断但原生可解」「缺最后块标记」「缺校验和」「合法帧后跟垃圾」「JSONL 第二行损坏/空行/空内容/UTF-8 损坏」「解压能力缺失时保守拒写」「解压输出有界」等；HTTP 传输同样走同一校验（engine.test 冲突场景）。 | PASS |
+| W4-B9 容量上限 | `lib/limits.js:45-74 requestBuffer`（超时覆盖整个响应体、声明长度 + 逐块双重上限）、`:76-93 parsePeerIndex`（16MiB、100000 条、blob 元数据 200MiB）、`:13-42`（stat 后增长不可绕过）；`lib/server.js:16-50` 请求体 200MiB（413）。工作区路径：输入 `lib/workspace.js:387`（`readWorkspaceStatus` 32MiB 有界）、并集构造期 `:52-66 unionIds`（100000，不先构造再截断）、产物 `:309-381 assertWorkspaceLimits/serializeWorkspaceDoc`（条目数/数组 100000、32MiB、循环引用与非 JSON 值拒绝），domain 与 proposal 两条路径同一检查（`:475-476,484`）；拉取落盘 `lib/engine.js:383-384` 按 rel 限额、`lib/store.js:60` 索引前拒读超限。 | 工作区 B9 三组（domain 输入/产物 32MiB、数组与表 100000，超限零 put/set 或保留原建议）；离线「B9 响应体超时/逐块限额/200MB 文件/32MiB 工作区缓存与 index/16MB 解析/100000 条」「服务端真实 handler 超限」「坏 peer 跳过后续继续」；`tests/engine.test.mjs`「B9 响应体超时/200MB/16MB/100000条 + N1」与「服务端超限请求体拒收」。 | PASS |
+| W5 测试 | `tests/workspace.compat.test.mjs` 已改为 mock domain/proposal 双模式 14 组；`tests/apply.compat.test.mjs` 覆盖 W4 三场景与 W1 防护共 37 项；`tests/engine.offline.test.mjs` 7 组（含注入生命周期）；`tests/fixture.accept.test.mjs` 真实事故 fixture（domain+proposal 双模式）；`tests/engine.test.mjs` 真实 HTTP 双节点（初始同步、sessionIds 并集、双端冲突、幂等零流量、宿主哨兵、state 恢复、资源边界、请求体上限）。 | 五个测试文件（见下表）全部 exit 0。 | PASS |
+| W6 README | `README.md:125-142`「工作区索引写入模式」：domain/proposal 对照表、为什么不再直接写文件（与宿主并发写共用队列、回滚会覆盖宿主新数据）、状态字段与建议文件位置、合并/校验/容量规则、升级注意（未提供服务自动 proposal、逐条一致非整轮原子、旧备份不自动恢复）。 | 文档核对。 | 完成 |
+
+## 验收命令与结果
+
+`node --check`：`index.js` + `lib/` 全部 10 个 js + `tests/` 全部 5 个 mjs = 16 个文件，全部 exit 0。
+
+| 命令 | 结果 | 备注 |
+|---|---|---|
+| `node tests/workspace.compat.test.mjs` | exit 0，14 组 ALL PASS | mock domain 事务 + proposal 降级 + 哨兵证明宿主文件只读。 |
+| `node tests/apply.compat.test.mjs` | exit 0，37 项 ALL PASS | B7/B8/B9 + W1 路径防护。 |
+| `node tests/engine.offline.test.mjs` | exit 0，7 组 ALL PASS | 真实文件 + 真实引擎周期 + 内存 fetch；不替代 HTTP 验收。 |
+| `node tests/fixture.accept.test.mjs` | exit 0，ALL PASS | 真实事故 fixture（local `8c8d9507…`、staging `f0d548c9…`）：输出合法 v2、`initialized` 保留、本地递归键不缩减、sessionIds 并集、宿主字节不变。 |
+| `node tests/engine.test.mjs` | exit 0，ALL PASS | **本轮沙箱放行监听，v2 遗留的该项验收现已通过**：真实 HTTP 双节点全流程。 |
+
+写入自检（规格验收第 4 条）：`grep -rnE "(writeFile|rename|copyFile|appendFile|open\(|createWriteStream)" lib/ index.js` 过滤 `workspace` 无结果——仓库代码不存在以 `storages/workspace.json` 为目标的写调用；该路径仅出现在 `lib/export.js:100`、`lib/workspace.js:461` 两处只读 `readWorkspaceStatus`。测试内的写入均指向 `tests/.tmp` 临时目录，不触及真实数据。
+
+## 遗留风险
+
+1. `tests/engine.test.mjs` 依赖环境放行本机端口监听；换环境重跑前不能视为永久通过。
+2. proposal 模式依赖宿主提供 `storageDomain` 或人工处理 `proposed/workspace.json`；建议每轮参与合并故不会丢失，但长期不接入宿主时工作区索引不会落盘到宿主。
+3. 无原生 zstd 解压能力的 Node（如 20.x）会话自动落回保守拒绝（推送/拉取到 staging 不受影响）；需 Node ≥ 22.15/23.8+。
+4. domain 写入是逐条一致，非整轮原子提交；中途失败下一轮从 domain 实际状态继续（README 已声明）。
+5. 测试基于 FIX-SPEC-v3 的 domain 契约 mock；真实宿主 `DomainImpl` 的校验/排队语义如有出入，需真机联调验证。
+6. 规格验收第 5 条「交 Codex 第三轮审核，无 BLOCKER 才允许启用」尚未执行，启用前待 PM 安排。
