@@ -1,11 +1,13 @@
-// v1.2.1 registry applier 测试：纯 mock 宿主 workspaceRegistry/sessionPersistence，
-// 不碰真实宿主与真实 ~/.dsh。覆盖 FIX-SPEC v1.2.1 R1-R5：
+// v1.2.2 registry applier 测试：纯 mock 宿主 workspaceRegistry/sessionPersistence，
+// 不碰真实宿主与真实 ~/.dsh。覆盖 FIX-SPEC v1.2.1 R1-R5 + v1.2.2：
 // R1 注入回调契约 (injectCtx, config) 与服务可用性校验（缺方法/空对象 → proposal）；
 // R2 既有 workspace 零 setTitle（标题只在 create 新建时传入）；
 // R3 坏文档（engine 门禁 + applier 防御自检）零 mutation；
 // R4 路径只映射一次（engine 全链路，pathRemap 的 to 含 from 以暴露二次映射）；
 // R5 逐 API 故障注入（resolveByPath/create/stat/attach/archive/pin 各自断言后续条目继续、
-//    其它 API 调用次数符合预期，不再整体短路）。
+//    其它 API 调用次数符合预期，不再整体短路；v1.2.2 补 attach/archive/pin 首项失败次项继续）；
+// v1.2.2 BLOCKER 回归：「先坏后好」双 peer——本轮任一次合并失败即整轮零 registry mutation；
+// v1.2.2 NIT2：带 archived/pinned 的重复轮幂等（宿主 no-op 语义，成功调用计数）。
 import assert from 'node:assert/strict'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
@@ -13,6 +15,7 @@ import { fileURLToPath } from 'node:url'
 import { createEngine } from '../lib/engine.js'
 import { applyRegistryIndex, registryServicesUsable } from '../lib/registry-apply.js'
 import { apply as applyPlugin } from '../index.js'
+import { sha1 } from '../lib/util.js'
 
 const tmpRoot = fileURLToPath(new URL('./.tmp/', import.meta.url))
 await fsp.mkdir(tmpRoot, { recursive: true })
@@ -398,6 +401,58 @@ try {
     console.log('场景6 R5 逐 API 故障注入（resolve/create/stat/attach/archive/pin） PASS')
   }
 
+  // ---------- 场景 6g-6i：R5 v1.2.2 补充——attach/archive/pin「首项失败、次项成功」 ----------
+  {
+    // 6g attachSession：第一个会话 id 抛错 → 错误进 warning，第二个仍 attach（计数 +1），循环继续
+    {
+      const alpha = await freshDir('s6g/projects/alpha')
+      const state = {
+        byPath: new Map([[alpha, { id: 'ws-a', path: alpha, title: 'alpha', sessionIds: [] }]]),
+        sessions: new Set(['s1', 's2']),
+        activeSessions: new Set(), archived: new Set(), pinned: new Set(),
+      }
+      const registry = mockRegistry(state, { throwAttach: 's1' })
+      const sp = mockSessionPersistence(state.sessions)
+      const out = await applyRegistryIndex({ registry, sessionPersistence: sp, doc: doc({
+        [alpha]: wsEntry(alpha, 'alpha', ['s1', 's2']),
+      }) })
+      assert.equal(out.error, null)
+      assert.deepEqual(registry.calls.attach, [`${alpha}#s1`, `${alpha}#s2`], '首项 s1 抛错后 s2 仍被调用（计数 +1）')
+      assert.ok(out.registryWarnings.some((w) => w.includes('s1') && w.includes('attach failed')), '首项错误进 warnings')
+      assert.equal(out.registryApplied.sessions, 1, '仅次项成功计数')
+      assert.deepEqual(state.byPath.get(alpha).sessionIds, ['s2'], '失败的 s1 未入表，s2 已入表')
+    }
+    // 6h archiveSession：第一个 id 抛错 → warning，第二个仍 archive，归档循环不中断
+    {
+      const state = emptyState()
+      state.sessions = new Set(['sa1', 'sa2'])
+      const registry = mockRegistry(state, { throwArchive: (id) => id === 'sa1' })
+      const sp = mockSessionPersistence(state.sessions)
+      const out = await applyRegistryIndex({ registry, sessionPersistence: sp, doc: doc({}, { archivedSessionIds: ['sa1', 'sa2'] }) })
+      assert.equal(out.error, null)
+      assert.deepEqual(registry.calls.archive, ['sa1', 'sa2'], '首项 sa1 抛错后 sa2 仍被调用（计数 +1）')
+      assert.ok(out.registryWarnings.some((w) => w.includes('sa1') && w.includes('archive failed')), '首项错误进 warnings')
+      assert.equal(out.registryApplied.archived, 1, '仅次项成功计数')
+      assert.equal(state.archived.has('sa2'), true)
+      assert.equal(state.archived.has('sa1'), false)
+    }
+    // 6i pinSession：第一个 id 抛错 → warning，第二个仍 pin，置顶循环不中断
+    {
+      const state = emptyState()
+      state.sessions = new Set(['sp1', 'sp2'])
+      const registry = mockRegistry(state, { throwPin: (id) => id === 'sp1' })
+      const sp = mockSessionPersistence(state.sessions)
+      const out = await applyRegistryIndex({ registry, sessionPersistence: sp, doc: doc({}, { pinnedSessionIds: ['sp1', 'sp2'] }) })
+      assert.equal(out.error, null)
+      assert.deepEqual(registry.calls.pin, ['sp1', 'sp2'], '首项 sp1 抛错后 sp2 仍被调用（计数 +1）')
+      assert.ok(out.registryWarnings.some((w) => w.includes('sp1') && w.includes('pin failed')), '首项错误进 warnings')
+      assert.equal(out.registryApplied.pinned, 1, '仅次项成功计数')
+      assert.equal(state.pinned.has('sp2'), true)
+      assert.equal(state.pinned.has('sp1'), false)
+    }
+    console.log('场景6g-6i attach/archive/pin 首项失败次项继续 PASS')
+  }
+
   // ---------- 场景 7：R4 engine 全链路只映射一次 ----------
   // pathRemap 故意取 to=from+'/local'（二次映射会产生 /local/local 并触发目录不存在警告）。
   {
@@ -662,7 +717,90 @@ try {
     console.log('场景10 engine registry 正常路径/幂等/状态/stat 抛错 PASS')
   }
 
-  console.log('ALL PASS（registry.test.mjs：R1-R5 覆盖，10 组场景）')
+  // ---------- 场景 11：v1.2.2 BLOCKER 回归——「先坏后好」双 peer，整轮零 registry mutation ----------
+  // peer1 拉回缺 createdAt 的坏条目（合并宽容跳过：merged:true + errors）→ peer2 拉回合法
+  // 文档（合并成功）。旧行为：最后一次成功合并覆盖失败标记，registry 照常应用（BLOCKER）；
+  // 新行为：workspaceMergeFailed 本轮累计不清除，registry 四类 API 零调用，peer1 错误保留。
+  {
+    const cycleHome = path.join(home, 's11-engine')
+    await writeHostWorkspace(cycleHome, doc({}))
+    const goodDir = await freshDir('s11/projects/good')
+    const badId = 'ws-bad-entry'
+    const badBytes = Buffer.from(JSON.stringify({
+      unit: { name: 'workspace', version: 2 },
+      global: { initialized: true, workspaceIds: [badId], defaultWorkspaceId: '', archivedSessionIds: [], pinnedSessionIds: [] },
+      tables: { workspaces: { [badId]: { path: '/nowhere/bad', title: 'Bad', sessionIds: [], updatedAt: '2026-01-02T00:00:00Z' } } },
+    }))
+    const goodBytes = Buffer.from(JSON.stringify(doc({ [goodDir]: wsEntry(goodDir, 'Good', ['s1']) })))
+    const previousFetch = globalThis.fetch
+    globalThis.fetch = async (url, init = {}) => {
+      if (init.method === 'PUT') return Response.json({ ok: true })
+      const parsed = new URL(url)
+      const bytes = parsed.hostname === 'peer1-bad' ? badBytes : goodBytes
+      if (parsed.pathname === '/v1/index') return Response.json({ files: { 'workspace/workspace.json': { sha1: sha1(bytes), size: bytes.length } } })
+      return new Response(bytes)
+    }
+    const state = emptyState()
+    state.sessions = new Set(['s1'])
+    const registry = mockRegistry(state)
+    const sp = mockSessionPersistence(state.sessions)
+    const engine = createEngine({ rowConfig: {
+      dshHome: cycleHome, deviceName: 's11', listenPort: 0, token: 't', settleSec: 0,
+      peers: [{ name: 'peer1', url: 'http://peer1-bad' }, { name: 'peer2', url: 'http://peer2-good' }],
+    } })
+    engine.setServices({ workspaceRegistry: registry, sessionPersistence: sp })
+    try {
+      await engine.init()
+      const summary = await engine.runCycle()
+      assert.equal(summary.workspaceWriteMode, 'registry')
+      assert.equal(summary.merged, 3, '三次合并全部执行（初始 + peer1 + peer2），peer2 合并成功计入 merged')
+      assert.equal(summary.registryApplied, null, '先坏后好：registry 整轮零 mutation')
+      assert.ok(summary.registrySkippedReason?.includes('零 mutation'), 'registrySkippedReason 写明跳过原因')
+      zeroMutationCalls(registry, sp, '先坏后好')
+      assert.ok(summary.errors.some((m) => m.includes(badId) && m.includes('createdAt')), 'peer1 的合并错误保留（不被后续成功合并覆盖）')
+      assert.ok(summary.warnings.some((m) => m.includes('零 mutation')), '跳过警告本轮可见')
+      const status = await engine.status()
+      assert.equal(status.registrySkippedReason, summary.registrySkippedReason, 'status 暴露 registrySkippedReason')
+    } finally {
+      await engine.close()
+      globalThis.fetch = previousFetch
+    }
+    console.log('场景11 v1.2.2 先坏后好（peer1 坏条目 → peer2 成功 → registry 零 mutation、errors 保留） PASS')
+  }
+
+  // ---------- 场景 12：v1.2.2 NIT2——带 archived/pinned 的重复轮幂等 ----------
+  // applier 没有「查询已归档/已置顶」的宿主 API，每轮对远端集合重新调用 archive/pin；
+  // 宿主对已归档/已置顶的重复调用是 no-op。archived/pinned 计数口径 = 成功调用的 API 次数（含 no-op）。
+  {
+    const alpha = await freshDir('s12/projects/alpha')
+    const state = emptyState()
+    state.sessions = new Set(['s1', 'sa', 'sp'])
+    state.archived = new Set(['sa'])
+    const registry = mockRegistry(state)
+    const sp = mockSessionPersistence(state.sessions)
+    const docValue = doc({ [alpha]: wsEntry(alpha, 'alpha', ['s1']) }, { archivedSessionIds: ['sa'], pinnedSessionIds: ['sp'] })
+    const first = await applyRegistryIndex({ registry, sessionPersistence: sp, doc: docValue })
+    assert.deepEqual(first.registryApplied, { workspaces: 1, created: 1, sessions: 1, archived: 1, pinned: 1 }, '首轮全量应用')
+    assert.deepEqual(first.registryWarnings, [])
+    const firstCalls = structuredClone(registry.calls)
+    const second = await applyRegistryIndex({ registry, sessionPersistence: sp, doc: docValue })
+    assert.equal(second.error, null)
+    assert.deepEqual(second.registryWarnings, [], 'no-op 重复调用不产生警告')
+    assert.equal(second.registryApplied.created, 0, '第二轮零 create')
+    assert.equal(second.registryApplied.sessions, 0, '第二轮零 attach')
+    assert.equal(second.registryApplied.workspaces, 1, '第二轮仅确认工作区存在')
+    assert.equal(second.registryApplied.archived, 1, '已归档会话：宿主 no-op，仍调用并计成功（口径=成功调用次数）')
+    assert.equal(second.registryApplied.pinned, 1, '已置顶会话：同上')
+    assert.deepEqual(registry.calls.create, firstCalls.create, 'create 调用不重复')
+    assert.deepEqual(registry.calls.attach, firstCalls.attach, 'attach 调用不重复')
+    assert.deepEqual(registry.calls.archive, [...firstCalls.archive, 'sa'], 'archive 每轮重新调用（宿主 no-op）')
+    assert.deepEqual(registry.calls.pin, [...firstCalls.pin, 'sp'], 'pin 每轮重新调用（宿主 no-op）')
+    assert.equal(state.archived.has('sa'), true, '归档集合只加不减')
+    assert.equal(state.pinned.has('sp'), true, '置顶集合只加不减')
+    console.log('场景12 v1.2.2 带 archived/pinned 的重复轮幂等（宿主 no-op 语义） PASS')
+  }
+
+  console.log('ALL PASS（registry.test.mjs：R1-R5 + v1.2.2 覆盖，12 组场景）')
 } finally {
   await fsp.rm(home, { recursive: true, force: true })
 }

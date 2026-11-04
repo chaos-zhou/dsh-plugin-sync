@@ -9,6 +9,8 @@ DSH 多端同步插件：在两台（或多台）安装了 DSH 的设备之间�
 > **v1.1.2 安全补强**：日志追加/轮转增加硬链接防护（目标 `nlink>1` 拒绝，打开后 `fstat` 复核），日志拒绝不再静默而是计入本轮 `errors[]`；目录创建收敛到 `guardedMkdir`（`plugin-sync` 或 `storages` 被符号链接劫持时初始化零创建）；safe-writer 全部内部异常转为结构化拒绝。同时如实声明防护能力边界（`O_NOFOLLOW` 只保护最后一级、校验与 `rename` 之间存在 TOCTOU 窗口），详见「路径边界防护」。
 >
 > **v1.2 自动应用**：宿主提供 `ctx.workspaceRegistry` / `ctx.sessionPersistence` 事务 API 时，插件在每轮 apply 之后经该 API 把合并结果**增量应用**到本机工作区/会话列表（registry 模式）——仍然**不写任何宿主 JSON 文件**；服务不可用时自动回退 v1.1.2 的 proposal 模式。详见「自动应用（registry 模式）」。
+>
+> **v1.2.2 失败累计**：一轮内**任意一次**工作区合并失败（`merged:false` 或有合并错误）即整轮跳过 registry 应用（零 mutation）——即使后续 peer 的合并成功也不恢复；跳过原因写入 `registrySkippedReason`。同时明确 `registryApplied.archived/pinned` 计数口径：**成功调用的 API 次数**（宿主对已归档/已置顶的 no-op 也计数），合并失败被跳过的轮次不计数。
 
 ## 安装
 
@@ -147,7 +149,7 @@ v1.2 起有两种模式，由宿主是否提供事务 API 自动决定（`dsh_sy
 
 **输入**：engine 传入的**合并产物**（含远端工作区、归档/置顶集合的并集，其中路径已完成 `pathRemap` 本地化）＋从 registry 实时读取的本机现状。每轮都重新读现状算差量，不缓存本地快照。
 
-**零 mutation 条件（v1.2.1）**：只有「本轮合并成功（`merged:true`）且合并 `errors` 为空、产物通过 `validateWorkspaceDoc(requireEnvelope)`」才会调用任何 registry API；合并被拒、存在合并错误、产物校验失败时**一轮内零 create/attach/archive/pin/stat**（applier 入口还会防御性自检一次）。
+**零 mutation 条件（v1.2.2，失败累计）**：只有「本轮**全部**合并都成功（每次 `merged:true` 且无合并错误）且最终产物通过 `validateWorkspaceDoc(requireEnvelope)`」才会调用任何 registry API。一轮内可能发生多次合并（每轮初始合并一次 + 每个 peer 拉回 `workspace.json` 后各一次）：**任何一次**合并被拒（`merged:false`）或产生合并错误即置本轮失败标记，且**不被后续成功合并清除**——例如 peer1 拉回坏条目、peer2 拉回合法数据时，不会因最后一次合并成功而掩盖早期失败。失败时**整轮零 create/attach/archive/pin/stat**，合并错误保留在本轮 `errors[]`，跳过原因写入 `registrySkippedReason`（applier 入口还会防御性自检一次）。
 
 **只使用这些宿主 API**：`workspaceRegistry.create / resolveByPath / archiveSession / pinSession`、`Workspace.attachSession`、`sessionPersistence.stat`。`lib/registry-apply.js` 内没有任何 fs 写调用（仓库 grep 自检佐证）；unarchive/unpin/insertBefore 等减序 API 一律不调用——**远端状态只加不减**；`setTitle` 不再调用（见下）。
 
@@ -158,11 +160,11 @@ v1.2 起有两种模式，由宿主是否提供事务 API 自动决定（`dsh_sy
 | 会话 | 远端 `sessionIds` 中本工作区尚没有的 id：宿主未识别 → warning 下轮重试；否则 `attachSession`（已存在不重复 attach） |
 | 标题 | **既有 workspace 不跨设备同步重命名**（v1.2.1 起）：远端标题只在 `create` 新建时传入；已存在的 workspace 保持本地标题。原因：宿主 mutation queue 没有条件更新 API，任何「先比对再 setTitle」都与队列内排队的本地改名竞争、必然互相覆盖；等宿主提供条件更新 API 后再恢复跟随 |
 
-**幂等与并发语义**：attach/archive/pin 都是宿主 mutation queue 内的单条持久化操作，重复调用应无害（已 attach 不重复、已归档/已置顶为 no-op）。全部已存在时一轮的增量为零（`registryApplied` 各计数为 0，仅 `workspaces` 表示「确认存在」的工作区数，其中 `created` 为本轮实际新建数）。单条失败记入 `registryWarnings[]`，下一轮自动重试，**不做整轮回滚**。
+**幂等与并发语义**：attach/archive/pin 都是宿主 mutation queue 内的单条持久化操作，重复调用应无害（已 attach 不重复、已归档/已置顶为 no-op）。全部已存在时一轮的增量为零（`registryApplied` 的 created/sessions 为 0，仅 `workspaces` 表示「确认存在」的工作区数，其中 `created` 为本轮实际新建数）。**`archived`/`pinned` 计数口径（v1.2.2 明确）**：统计**成功调用的 API 次数**——宿主没有「查询会话是否已归档/已置顶」的 API，applier 每轮都会对远端集合里的每个会话重新调用 `archiveSession`/`pinSession`；宿主对已归档/已置顶的重复调用是 no-op，但仍调用并计入成功次数。合并失败被整轮跳过的轮次不计数。单条失败记入 `registryWarnings[]`，下一轮自动重试，**不做整轮回滚**。
 
 **跨系统路径映射（只映射一次）**：远端工作区路径在合并阶段用配置 `pathRemap: [{from, to}]` 做字符串替换（`lib/workspace.js` 的 `applyRemap`），例如 macOS 的 `/Users/x/proj` ↔ Linux 的 `/home/x/proj`；applier 直接使用合并产物中的路径，**绝不再做第二次映射**（v1.2 的二次映射曾把 `/a` 变成 `/a/local/local` 导致正确目录被跳过）。映射后本地不存在的工作区整条跳过（含其会话），不猜测、不创建目录。
 
-**失败契约**：applier 自身不抛出——单条失败一律转 `registryWarnings[]`（前缀 `registry:`）并计入 `dsh_sync_status`；合并被拒、合并错误、产物校验失败这类「不能安全应用」的情况升级为本轮 `errors[]`/`warnings[]` 并零 mutation 跳过。状态字段：`registryAvailable`（本轮服务是否可用）、`registryApplied`（本轮增量 `{workspaces, created, sessions, archived, pinned}`）、`registryLastApplied`（最近一次成功应用摘要）、`registryWarnings`（最近一轮的警告）。
+**失败契约**：applier 自身不抛出——单条失败一律转 `registryWarnings[]`（前缀 `registry:`）并计入 `dsh_sync_status`；合并被拒、合并错误、产物校验失败这类「不能安全应用」的情况升级为本轮 `errors[]`/`warnings[]` 并零 mutation 跳过（v1.2.2：合并失败按**轮内累计**判定，任一次失败即跳过，见「零 mutation 条件」）。状态字段：`registryAvailable`（本轮服务是否可用）、`registryApplied`（本轮增量 `{workspaces, created, sessions, archived, pinned}`）、`registrySkippedReason`（本轮 registry 应用被跳过的原因，正常应用时为 null）、`registryLastApplied`（最近一次成功应用摘要）、`registryWarnings`（最近一轮的警告）。
 
 **安全约束不变**：不写宿主文件、全部文件写仍经 `lib/safe-writer.js`、proposal 持续生成。若需要回退到纯 proposal 行为，把插件 bundle 换回 v1.1.2 或在宿主侧停掉 registry 服务注入即可。
 
@@ -223,7 +225,7 @@ node tests/apply.compat.test.mjs      # 跨周期冲突保护、坏zstd/JSONL、
 node tests/engine.offline.test.mjs    # 沙箱补充：真实文件与周期，内存 fetch 响应，不能代替 HTTP 验收
 node tests/fixture.accept.test.mjs    # 读取 /tmp/dsh-sync-accept 两份事故 fixture，在仓库临时目录合并
 node tests/security.symlink.test.mjs  # 14 组攻击：符号链接/硬链接/目录污染/故障注入，宿主字节不变、零写系统调用
-node tests/registry.test.mjs          # v1.2 registry 应用：8 类场景（命中/幂等/stat缺失/缺目录/archive-pin/标题/降级/异常）+ engine/index 接入，纯 mock
+node tests/registry.test.mjs          # v1.2 registry 应用：12 组场景（命中/幂等/stat缺失/缺目录/archive-pin/标题/逐API故障注入/降级/异常 + v1.2.2 先坏后好/重复轮幂等）+ engine/index 接入，纯 mock
 ```
 
 各测试成功均输出 `ALL PASS`；HTTP 测试需要允许本机端口监听。
