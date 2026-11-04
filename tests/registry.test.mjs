@@ -13,7 +13,7 @@ import fsp from 'node:fs/promises'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createEngine } from '../lib/engine.js'
-import { normalizeRemapRules } from '../lib/workspace.js'
+import { normalizeRemapRules, mapPathOnce, isSafeAbsolutePath } from '../lib/workspace.js'
 import { mergeWorkspaces } from '../lib/workspace.js'
 import { applyRegistryIndex, registryServicesUsable } from '../lib/registry-apply.js'
 import { apply as applyPlugin } from '../index.js'
@@ -902,6 +902,47 @@ try {
     await applyRegistryIndex({ registry: reg4, sessionPersistence: mockSessionPersistence(new Set()), doc: doc({ w2: { path: 'c:/Users/A/p', title: 't', sessionIds: [], createdAt: 'x', updatedAt: 'x' } }), pathRemap: [{ from: 'C:/Users/A', to: path.join(home, 'ci', 'local') }], log: quiet })
     assert.deepEqual(reg4.calls.resolveByPath, [ciDir], '盘符大小写不敏感匹配')
     console.log('v1.3.1 UNC 拒绝 + 盘符大小写不敏感 PASS')
+  }
+
+  // ---- v1.3.2：根路径拒绝、混合分隔符、stat 故障不当作“不存在” ----
+  {
+    const quiet = { info: async () => {}, warn: async () => {}, error: async () => {} }
+    // 1) 根路径规则被拒绝
+    const roots = normalizeRemapRules([{ from: '/', to: '/mapped' }])
+    assert.ok(roots.errors.length > 0, 'from=/ 被拒绝')
+    const roots2 = normalizeRemapRules([{ from: '/source', to: '/' }])
+    assert.ok(roots2.errors.length > 0, 'to=/ 被拒绝')
+    const roots3 = normalizeRemapRules([{ from: 'C:/', to: '/dest' }])
+    assert.ok(roots3.errors.length > 0, 'from=C:/ 被拒绝')
+    console.log('v1.3.2 根路径规则拒绝 PASS')
+
+    // 2) 混合分隔符/UNC：POSIX 路径含反斜杠 → 不合法；映射结果复验
+    assert.equal(isSafeAbsolutePath('/source/..\\outside'), false, 'POSIX 含反斜杠判为不合法')
+    assert.equal(isSafeAbsolutePath('/\\server\\share'), false, '混合 UNC 判为不合法')
+    const mappedBad = mapPathOnce('/source/..\\outside', [{ from: '/source', to: '/dest' }])
+    assert.ok(mappedBad.errors.length > 0, '映射结果复验拒绝')
+    console.log('v1.3.2 混合分隔符/UNC 拒绝 PASS')
+
+    // 3) stat EIO 不当作不存在（不得回退到映射目标）
+    const targetDir = path.join(home, 'v132', 'target')
+    await fsp.mkdir(targetDir, { recursive: true })
+    const st = emptyState()
+    const reg = mockRegistry(st)
+    const eio = new Error('io error'); eio.code = 'EIO'
+    const out = await applyRegistryIndex({
+      registry: reg,
+      sessionPersistence: mockSessionPersistence(st.sessions),
+      doc: doc({ w1: { path: '/source', title: 't', sessionIds: ['s1'], createdAt: 'x', updatedAt: 'x' } }),
+      pathRemap: [{ from: '/source', to: targetDir }],
+      statFn: async (p) => {
+        if (p === '/source') throw eio
+        return { isDirectory: () => true }
+      },
+      log: quiet,
+    })
+    assert.equal(reg.calls.create.length + reg.calls.attach.length, 0, 'stat EIO 不得继续 create/attach')
+    assert.ok(out.registryWarnings.some((w) => w.includes('EIO')), 'EIO warning 可见')
+    console.log('v1.3.2 stat EIO 不当作不存在 PASS')
   }
 
   console.log('ALL PASS（registry.test.mjs：R1-R5 + v1.2.2 覆盖，12 组场景）')
