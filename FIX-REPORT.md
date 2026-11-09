@@ -384,3 +384,28 @@ Codex 审核 v1.3.0 指出：
 - `normalizeRemapRules`/`isSafeAbsolutePath`/`mapPathOnce` 严格化：仅 POSIX/盘符绝对路径，拒绝 UNC 与点段，保留根，盘符大写归一，POSIX 路径不转换反斜杠。
 - 测试新增：反馈循环三轮不映射、非法规则零 archive/pin、`.` 路径零 mutation、UNC 拒绝、盘符大小写不敏感。
 - PM 真实数据验证：本机 path 不映射、远端 Windows path 映射一次、attach 6 会话、零 error。
+
+---
+
+# v1.4.0：插件自更新 + 配置命令 + 本地管理页（自助化，不依赖 DSH Agent）
+
+## 背景
+此前检查版本、改配置、触发同步都必须通过 DSH 对话让 Agent 调工具；DSH 没启动时配置完全改不了。v1.4.0 把这三件事做成插件自带能力：自更新（lib/update.js）、CLI（bin/dsh-sync.mjs）、本地管理页（GET /admin）。
+
+## 方案
+- **自更新 `lib/update.js`（零依赖）**：`checkUpdate` 请求 GitHub `releases/latest`，404 回退 `/tags` 取最大 semver；`applyUpdate` 下载 `codeload` tar.gz（20MB/30s 上限，流式计数不信 Content-Length），`node:zlib` gunzip + 手写 tar 解析（逐条 512 字节头校验和；拒绝绝对路径/`..`/反斜杠/符号链接/硬链接/设备条目；≤2000 条、≤64MB），校验新包 `package.json` name+version，备份当前白名单文件到 `dataDir/updates/backup-<old>-<ts>/`（含 manifest.json），逐文件「guardedWrite 临时文件 + rename」替换白名单（index.js/lib/bin/hub.mjs/cordis.patch.yml/package.json/locale/icon.svg/README.md；`.git`、`node_modules`、数据文件不动），失败自动回滚并移除新增文件，成功写 `updates/state.json`（pendingVersion/restartRequired）。`readUpdateState`/`clearPending` 管理状态；engine init 时运行版本==pendingVersion 即清除「待重启」。替换前校验 installRoot 自身 `package.json` name 匹配——拒绝更新非本插件目录。低版本默认拒绝（force 显式放行）。
+- **管理端 `lib/server.js`**：`/admin`（内联中文单页 lib/admin-html.js，数据渲染全用 textContent）+ `/v1/admin/status|config|sync|update/check|update/apply`。鉴权顺序：先 loopback（socket 真实地址，403）再 token（401；浏览器场景允许 `?token=` 查询参数）；全部响应 `no-store`。管理处理器由 engine 注入；sync 异步触发不阻塞 HTTP，inFlight 时返回 `{started:false}`。
+- **CLI `bin/dsh-sync.mjs`**：status / config get|set|add-peer|remove-peer|set-token|set-remap|remove-remap / sync / update check|apply / version / help。优先调管理 API；服务不可用时配置命令回退直写 config.json（guardedMkdir+saveConfig 防护）并提示需重载/重启，update 回退直接检查/下载替换。`DSH_SYNC_HOME` 覆盖数据目录；installRoot=CLI 自身上级目录。
+- **配置/状态**：DEFAULTS 新增 `repo`（chaos-zhou/dsh-plugin-sync）、`updateCheck`（false）、`autoApplyUpdate`（false；开启且检查到新版时自动替换，仍需重启）。`status()` 增加 `installedVersion`、`update:{latest, available, pendingVersion, restartRequired, checkedAt, error}`；updateCheck=true 时启动 30s 后首查、此后每 24h。
+- **版本/发布**：package.json 1.4.0，files 增加 `bin/*.mjs`，新增 `bin: {"dsh-sync": "bin/dsh-sync.mjs"}`；README 新增「更新插件」「配置命令 / 本地管理页」两节。
+
+## 安全要点
+- 管理端仅回环 + token；非回环 403 先于 token 校验；token 空 → 管理一律 401。
+- 更新只动插件安装目录与 `dataDir/updates/`；解包在 extract 临时目录（路径逐条校验）；所有安装目录写入经 safe-writer（无 dshHome 时仍做符号链接/父目录/O_NOFOLLOW 结构校验）；绝不写宿主 storages/profile。
+- 失败结构化：下载/解包/校验失败零副作用（清理 download/extract 临时文件）；替换失败回滚；全程不向宿主抛出。
+
+## 验证
+- 新增 `tests/update.test.mjs`（12 组：check 正常/404 回退/无更新/网络错误；apply 正常替换+可执行位、备份可还原、pending 写入与清除；包名/版本不匹配拒绝；低版本拒绝+force 重装；tar `..`/绝对路径/符号链接/设备类型拒绝；20MB 超限拒绝；替换中途注入 rename 失败→回滚+新增不残留+无 pending；下载失败零副作用）。
+- 新增 `tests/admin.test.mjs`（单元层：401/403 顺序、HTML 关键中文文案、config 读写与 400、sync started/inFlight、mock 更新检查与应用替换、全路由 no-store；engine 层：status 新字段、config 持久化与 needRestart、sync→lastRun、update check 缓存进 status、低版本拒绝；pending 版本不符保留、运行版本追上自动清除）。
+- 新增 `tests/cli.test.mjs`（8 组冒烟：version/help、config get 默认值、set 深合并持久化、get key/不存在、add/remove-peer、set-token 生成、set-remap/remove-remap 与非法路径拒绝、status 本地摘要、sync 未运行非零退出、未知命令报错；临时 DSH_SYNC_HOME + listenPort=0 确定性回退）。
+- 既有 7 套测试保持全绿；`node --check` 全部改动文件通过。

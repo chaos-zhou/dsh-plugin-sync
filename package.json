@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-sync",
-  "version": "1.3.2",
+  "version": "1.4.0",
   "private": true,
   "type": "module",
   "description": "跨设备同步 DSH 会话、附件与工作区索引：局域网点对点，或经一个 hub 服务器中转。",
@@ -22,9 +22,13 @@
     "./locale/*.json": "./locale/*.json",
     "./icon": "./icon.svg"
   },
+  "bin": {
+    "dsh-sync": "bin/dsh-sync.mjs"
+  },
   "files": [
     "index.js",
     "lib/*.js",
+    "bin/*.mjs",
     "hub.mjs",
     "cordis.patch.yml",
     "locale/*.json",
