@@ -384,3 +384,64 @@ Codex 审核 v1.3.0 指出：
 - `normalizeRemapRules`/`isSafeAbsolutePath`/`mapPathOnce` 严格化：仅 POSIX/盘符绝对路径，拒绝 UNC 与点段，保留根，盘符大写归一，POSIX 路径不转换反斜杠。
 - 测试新增：反馈循环三轮不映射、非法规则零 archive/pin、`.` 路径零 mutation、UNC 拒绝、盘符大小写不敏感。
 - PM 真实数据验证：本机 path 不映射、远端 Windows path 映射一次、attach 6 会话、零 error。
+
+---
+
+# v1.4.0：插件自更新 + 配置命令 + 本地管理页（自助化，不依赖 DSH Agent）
+
+## 背景
+此前检查版本、改配置、触发同步都必须通过 DSH 对话让 Agent 调工具；DSH 没启动时配置完全改不了。v1.4.0 把这三件事做成插件自带能力：自更新（lib/update.js）、CLI（bin/dsh-sync.mjs）、本地管理页（GET /admin）。
+
+## 方案
+- **自更新 `lib/update.js`（零依赖）**：`checkUpdate` 请求 GitHub `releases/latest`，404 回退 `/tags` 取最大 semver；`applyUpdate` 下载 `codeload` tar.gz（20MB/30s 上限，流式计数不信 Content-Length），`node:zlib` gunzip + 手写 tar 解析（逐条 512 字节头校验和；拒绝绝对路径/`..`/反斜杠/符号链接/硬链接/设备条目；≤2000 条、≤64MB），校验新包 `package.json` name+version，备份当前白名单文件到 `dataDir/updates/backup-<old>-<ts>/`（含 manifest.json），逐文件「guardedWrite 临时文件 + rename」替换白名单（index.js/lib/bin/hub.mjs/cordis.patch.yml/package.json/locale/icon.svg/README.md；`.git`、`node_modules`、数据文件不动），失败自动回滚并移除新增文件，成功写 `updates/state.json`（pendingVersion/restartRequired）。`readUpdateState`/`clearPending` 管理状态；engine init 时运行版本==pendingVersion 即清除「待重启」。替换前校验 installRoot 自身 `package.json` name 匹配——拒绝更新非本插件目录。低版本默认拒绝（force 显式放行）。
+- **管理端 `lib/server.js`**：`/admin`（内联中文单页 lib/admin-html.js，数据渲染全用 textContent）+ `/v1/admin/status|config|sync|update/check|update/apply`。鉴权顺序：先 loopback（socket 真实地址，403）再 token（401；浏览器场景允许 `?token=` 查询参数）；全部响应 `no-store`。管理处理器由 engine 注入；sync 异步触发不阻塞 HTTP，inFlight 时返回 `{started:false}`。
+- **CLI `bin/dsh-sync.mjs`**：status / config get|set|add-peer|remove-peer|set-token|set-remap|remove-remap / sync / update check|apply / version / help。优先调管理 API；服务不可用时配置命令回退直写 config.json（guardedMkdir+saveConfig 防护）并提示需重载/重启，update 回退直接检查/下载替换。`DSH_SYNC_HOME` 覆盖数据目录；installRoot=CLI 自身上级目录。
+- **配置/状态**：DEFAULTS 新增 `repo`（chaos-zhou/dsh-plugin-sync）、`updateCheck`（false）、`autoApplyUpdate`（false；开启且检查到新版时自动替换，仍需重启）。`status()` 增加 `installedVersion`、`update:{latest, available, pendingVersion, restartRequired, checkedAt, error}`；updateCheck=true 时启动 30s 后首查、此后每 24h。
+- **版本/发布**：package.json 1.4.0，files 增加 `bin/*.mjs`，新增 `bin: {"dsh-sync": "bin/dsh-sync.mjs"}`；README 新增「更新插件」「配置命令 / 本地管理页」两节。
+
+## 安全要点
+- 管理端仅回环 + token；非回环 403 先于 token 校验；token 空 → 管理一律 401。
+- 更新只动插件安装目录与 `dataDir/updates/`；解包在 extract 临时目录（路径逐条校验）；所有安装目录写入经 safe-writer（无 dshHome 时仍做符号链接/父目录/O_NOFOLLOW 结构校验）；绝不写宿主 storages/profile。
+- 失败结构化：下载/解包/校验失败零副作用（清理 download/extract 临时文件）；替换失败回滚；全程不向宿主抛出。
+
+## 验证
+- 新增 `tests/update.test.mjs`（12 组：check 正常/404 回退/无更新/网络错误；apply 正常替换+可执行位、备份可还原、pending 写入与清除；包名/版本不匹配拒绝；低版本拒绝+force 重装；tar `..`/绝对路径/符号链接/设备类型拒绝；20MB 超限拒绝；替换中途注入 rename 失败→回滚+新增不残留+无 pending；下载失败零副作用）。
+- 新增 `tests/admin.test.mjs`（单元层：401/403 顺序、HTML 关键中文文案、config 读写与 400、sync started/inFlight、mock 更新检查与应用替换、全路由 no-store；engine 层：status 新字段、config 持久化与 needRestart、sync→lastRun、update check 缓存进 status、低版本拒绝；pending 版本不符保留、运行版本追上自动清除）。
+- 新增 `tests/cli.test.mjs`（8 组冒烟：version/help、config get 默认值、set 深合并持久化、get key/不存在、add/remove-peer、set-token 生成、set-remap/remove-remap 与非法路径拒绝、status 本地摘要、sync 未运行非零退出、未知命令报错；临时 DSH_SYNC_HOME + listenPort=0 确定性回退）。
+- 既有 7 套测试保持全绿；`node --check` 全部改动文件通过。
+
+## v1.4.0 补充修复：真实 tarball 目录条目
+- Codex 探针发现：真实 GitHub tarball 含以 `/` 结尾的目录条目（如 `pkg/`、`pkg/lib/`），原 `isSafeTarName` 把尾部空段判为不安全导致解包失败。
+- 修复：目录条目先去掉尾部 `/` 再做安全校验；含 `..` 的目录条目仍拒绝。新增 `tests/update.test.mjs` D4/D5 用例。
+- 端到端验证：真实从 codeload 下载 v1.3.2 tarball → 安全解包（含目录条目）→ 备份 → 替换 → `restartRequired: true`，安装目录版本正确更新。
+
+## v1.4.1 安全加固（Codex 审核 7 BLOCKER + 3 NIT）
+
+日期：2026-11-09。范围冻结：只修 v1.4.0 审核问题，不新增功能。全部改动限于 `lib/config.js`、`lib/update.js`、`lib/server.js`、`lib/engine.js`、`lib/admin-html.js`、`bin/dsh-sync.mjs` 及对应测试；零依赖 ESM，未碰真实 `~/.dsh`，未执行 git commit。
+
+| 项目 | 修复位置与行为 | 对应测试 |
+|---|---|---|
+| B1 备份目录独占且写入走 safe-writer | `lib/update.js:385-402`：备份目录名加 `crypto.randomBytes(8)` 随机后缀，`fsp.mkdir(recursive:false, mode:0o700)` 独占创建（EEXIST/预置链接一律失败中止，替换前零副作用，且不清理非本进程创建的同名条目）；备份文件与 manifest 全部走 `guardedWrite({root: backupDir, dshHome})`。 | update H1（预置符号链接/重名目录 → 拒绝且宿主文件字节不变）、H2（成功路径备份目录 0o700） |
+| B2 回滚登记时序/权限/失败可恢复 | `lib/update.js:405-420`：先登记全部 planned `replaced/added` 再动手写（rename 后复核失败也能回滚当前文件）；manifest 提前到替换前写入备份目录（人工恢复有清单）；`rollback` 恢复原 mode（`stat.mode & 0o7777`，含执行位）；回滚失败返回 `backupDir`（非 null）并在 error 列出问题清单。 | update I1（注入 realpath 复核失败 → 旧内容+0o755 mode 保留、新增清理、无 pending）、J1（回滚失败 → backupDir 非空 + error 含问题 + 备份旧内容可查） |
+| B3 更新互斥 + CLI 超时语义 | `lib/update.js:326-341,458-460`：`dataDir/updates/.lock` 用 `fsp.open('wx', 0o600)` 独占创建、finally 删除；引擎自动更新（engine.applyUpdateNow）、admin 手动、CLI 直连共用 applyUpdate 内的锁。`bin/dsh-sync.mjs:78-106`：仅连接建立前失败（ECONNREFUSED/EADDRNOTAVAIL 等 PRE_CONNECT_CODES）回退离线；请求发出后超时/异常一律报「结果未知，请检查服务状态后重试」。 | update K1（并发双 apply：一个成功一个「已有更新在进行」、锁文件清理）、cli S10（挂起服务 + 超时 → 非零退出、无离线下载、config 不被改动） |
+| B4 解压上限 + 元数据条目计数 | `lib/update.js:356`：`gunzipSync(bytes, {maxOutputLength: MAX_TAR_TOTAL_BYTES+1})`，超限报「疑似 gzip 炸弹」；`:190-195`：所有 512 字节头（含 L/x/g/K）计入 `MAX_TAR_ENTRIES`，超限拒绝。 | update L1（65MiB 炸弹小包拒绝且零副作用）、M1（2001 个 g 元数据头拒绝） |
+| B5 管理端鉴权强化 | `lib/server.js:120-158`：socket 回环 → Host 头回环（防 DNS rebinding）→ token 仅认 `x-dsh-sync-token` 头（query token 一律拒绝）→ 非 GET 还要求 `content-type: application/json`（否则 415）且 `Origin`（若有）host 为回环（否则 403）；`GET /admin` 页面免 token（仅回环），`/v1/admin/*` 仍需 token；管理端与主 API 的 token 比较统一 sha256+`timingSafeEqual`（N2）。 | admin U1（query token 401、恶意 Host 403、text/plain 415、无 content-type 415、跨站 Origin 403、回环 Origin 放行、GET /admin 免 token 200）、U2 引擎层 401 |
+| B6 打码 token 不得回写 | `lib/config.js:64-95`：`looksMasked`（含 `*` 即视为打码串）+ `sanitizeConfigSet(set, current)`：顶层 token、`peers[].token` 打码/空串从 set 剔除，peers 整组替换场景下用当前配置真实值（同名优先、次同下标）回填，保证「只改其他字段保存」不丢凭据。接线：`engine.updateSettings`、admin PUT（引擎入口）、CLI `config set/add-peer/set-token/remap`（mutateConfig）。`admin-html.js` 增加打码提示，syncNow 带 JSON 头。 | admin U1（打码 token PUT 后内部 settings 不变）、U2 端到端（加载→只改 intervalSec→保存→token 与 peers token 保持原值、服务 200）、cli S3b（打码/空 token 不回写）、S9（打码 peer token 整组保存不丢） |
+| B7 凭据统一脱敏 | `lib/config.js:45-60`：`maskToken` 短 token（≤12）整体打码为 `********`、长 token 最多保留前 4 位；`publicSettings` 同时打码 `peers[].token`。`engine.status` 用 maskToken；CLI status 本地摘要整体走 publicSettings（peers 不再泄漏）；config get/status/admin API 输出全部打码。 | admin U1/U2（短 token `********`、输出不含完整 token）、cli S9（config get/status 全脱敏）、engine.test（长 token 前 4 位）、cli S3 |
+| N1 apply 默认最新 | `bin/dsh-sync.mjs:236-256`：`update apply` 不带 `--version` 时先 checkUpdate（API 或直连 GitHub），无更新提示「已是最新版本」退出 0，有更新取 latest 再 apply。 | admin U2（POST apply `{}` → 引擎默认取 latest → 低于当前版本被 force 拒绝，证明走了默认最新路径） |
+| N2 timingSafeEqual | 同 B5：`lib/server.js:39-43 tokensMatch`（sha256 归一定长后 `crypto.timingSafeEqual`），管理端与主 API 全部走该比较。 | admin U1/U2（错 token/无 token 401，行为不变） |
+| N3 latestTag/无 v 前缀 tag | `lib/update.js:81-110`：`checkUpdate` 返回 `latestTag`（保留原始 tag）；`applyUpdate` 接受 `tag` 参数（缺省 `v{version}`，tag 限定 `[\w.-]` 防注入），下载 URL 用原始 tag；`engine.applyUpdateNow`/CLI 均透传 latestTag。 | update A1/A2（latestTag 断言）、N1（无 v 前缀 tag 下载成功、URL 用 tag；缺省 v{version}）、admin U2 check.latestTag |
+
+## 验收命令与结果（实测，2026-11-09，Node v24.15.0 / macOS）
+
+- `node --check`：`lib/*.js`、`bin/*.mjs`、`index.js`、`hub.mjs`、`tests/*.test.mjs` 全部通过。
+- 10 套测试全绿：
+  1. `node tests/update.test.mjs` — 19 组 ALL PASS（含 B1/B2/B3/B4/N3 新增 9 组）；
+  2. `node tests/admin.test.mjs` — U1/U2/U3 ALL PASS（含 B5 鉴权矩阵、B6 端到端、B7 脱敏、N1 默认最新）；
+  3. `node tests/cli.test.mjs` — 12 组 ALL PASS（含 B3 挂起超时、B6 打码不回写、B7 全脱敏）；
+  4. `node tests/engine.test.mjs` — ALL PASS；5. `node tests/engine.offline.test.mjs` — ALL PASS；
+  6. `node tests/apply.compat.test.mjs` — ALL PASS；7. `node tests/fixture.accept.test.mjs` — ALL PASS；
+  8. `node tests/registry.test.mjs` — 12 组 ALL PASS；9. `node tests/security.symlink.test.mjs` — 14 组 ALL PASS；
+  10. `node tests/workspace.compat.test.mjs` — 15 组 ALL PASS。
+- 真实 tarball 端到端：真实 `api.github.com` checkUpdate（latest 1.3.2 / latestTag v1.3.2）→ codeload 下载真实 v1.3.2 tarball（含目录条目）→ 安全解包 → 独占随机备份目录（含 manifest）→ 白名单替换 → `restartRequired:true`、updates 仅剩备份+state.json。PASS。
+- grep 确认 B1-B7/N1-N3 全部有实现（备份独占 0o700/guardedWrite、planned 登记、.lock wx、maxOutputLength、timingSafeEqual/Host/Origin/Content-Type、looksMasked/sanitizeConfigSet、maskToken ≤12、latestTag）。

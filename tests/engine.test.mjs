@@ -315,7 +315,7 @@ async function main() {
     assert.strictEqual(engineB.listening, portB, 'B 监听端口')
 
     const statusA = await engineA.status()
-    assert.strictEqual(statusA.token, 'test-t' + '******', 'token 打码')
+    assert.strictEqual(statusA.token, 'test' + '****', 'token 打码（v1.4.1 B7：长 token 保留前 4 位）')
     assert.strictEqual(statusA.device, 'A')
     assert.strictEqual(statusA.workspaceWriteMode, 'proposal')
     assert.strictEqual(statusA.proposalPending, false)

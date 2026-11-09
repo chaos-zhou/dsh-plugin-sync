@@ -11,6 +11,8 @@ DSH 多端同步插件：在两台（或多台）安装了 DSH 的设备之间�
 > **v1.2 自动应用**：宿主提供 `ctx.workspaceRegistry` / `ctx.sessionPersistence` 事务 API 时，插件在每轮 apply 之后经该 API 把合并结果**增量应用**到本机工作区/会话列表（registry 模式）——仍然**不写任何宿主 JSON 文件**；服务不可用时自动回退 v1.1.2 的 proposal 模式。详见「自动应用（registry 模式）」。
 >
 > **v1.2.2 失败累计**：一轮内**任意一次**工作区合并失败（`merged:false` 或有合并错误）即整轮跳过 registry 应用（零 mutation）——即使后续 peer 的合并成功也不恢复；跳过原因写入 `registrySkippedReason`。同时明确 `registryApplied.archived/pinned` 计数口径：**成功调用的 API 次数**（宿主对已归档/已置顶的 no-op 也计数），合并失败被跳过的轮次不计数。
+>
+> **v1.4.0 自助管理**：插件自带**自更新**（检查 GitHub → 下载 tarball（≤20MB/30s）→ 安全解包校验 → 备份后白名单替换 → 标记待重启）、**CLI**（`bin/dsh-sync.mjs`：status / config / sync / update，DSH 未运行时回退直写 config.json）与**本地管理页**（`/admin`，仅本机回环 + token）。全程不依赖 DSH 对话/Agent；更新成功后需重启 DSH 生效。详见「更新插件」「配置命令 / 本地管理页」两节。
 
 ## 安装
 
@@ -63,8 +65,11 @@ DSH 多端同步插件：在两台（或多台）安装了 DSH 的设备之间�
 | `pathRemap` | `[]` | 工作区路径映射 `[{from, to}]`（字符串替换），用于把远端工作区路径翻译成本机路径 |
 | `applyConfig` | `false` | 暂停配置自动落回；即使设置为 `true` 也只记警告，配置仍可导出 |
 | `autoApply` | `true` | 保留字段（落回行为由 apply 规则控制） |
+| `repo` | `chaos-zhou/dsh-plugin-sync` | GitHub 仓库（`owner/name`），自更新检查/下载来源 |
+| `updateCheck` | `false` | 启动后 30 秒首查、之后每 24 小时自动检查 GitHub 新版本（结果进 `dsh_sync_status` 的 `update` 字段） |
+| `autoApplyUpdate` | `false` | 自动检查发现新版本时自动下载替换插件文件（仍需重启 DSH 生效）；默认关闭 |
 
-配置持久化在 `<dshHome>/plugin-sync/config.json`；可用 `dsh_sync_config` 工具在线修改（`listenPort`/`role`/`bindHost` 变更需要重启，其余字段下一轮自动生效）。
+配置持久化在 `<dshHome>/plugin-sync/config.json`；可用 `dsh_sync_config` 工具在线修改（`listenPort`/`role`/`bindHost` 变更需要重启，其余字段下一轮自动生效），也可以用自带 CLI 或本地管理页修改（见下文两节）。
 
 ## 三种拓扑
 
@@ -205,6 +210,57 @@ v1.1 历史设计（为何不直接写宿主 `storages/workspace.json`）：宿�
 | `dsh_sync_now` | 无 | 立即同步，返回计数、`workspaceWriteMode`、`registryApplied` / `registryWarnings`、`proposalPending` / `proposalPath` / `proposalPathSafe`、`errors[]` 和 `warnings[]` |
 | `dsh_sync_config` | `{set?}` | 无 `set` 返回当前设置（token 打码）；有 `set` 深合并写入 `config.json`，返回 `{settings, needRestart}` |
 
+`dsh_sync_status` 自 v1.4.0 起额外包含 `installedVersion` 与 `update` 字段（`{latest, available, pendingVersion, restartRequired, checkedAt, error}`）。
+
+## 更新插件（自更新）
+
+v1.4.0 起插件可以自己检查并安装新版本，不依赖 DSH 对话/Agent。两种入口：CLI（`dsh-sync update …`）或本地管理页的「检查更新 / 应用更新」按钮，底层都是同一条流程：
+
+1. **检查**：`GET https://api.github.com/repos/<repo>/releases/latest`；仓库没有 Release（404）时回退 `GET /tags` 取最大 semver tag。
+2. **下载**：`codeload.github.com/<repo>/tar.gz/refs/tags/v<版本>`，上限 20MB、超时 30s，流式计数，不信任 Content-Length。
+3. **安全解包**：`node:zlib` gunzip + 手写 tar 解析（逐条验证 512 字节头校验和）；拒绝绝对路径、`..` 段、反斜杠、符号链接/硬链接、设备等非普通文件条目；条目数 ≤2000、解包总量 ≤64MB。
+4. **校验包身份**：解包产物 `package.json` 的 `name` 必须等于 `dsh-plugin-sync`，`version` 必须等于目标版本。
+5. **备份**：把当前安装目录的白名单文件备份到 `<dataDir>/updates/backup-<旧版本>-<时间戳>/`（含 `manifest.json` 记录替换/新增清单）。
+6. **替换**：只替换白名单内容（`index.js`、`lib/`、`bin/`、`hub.mjs`、`cordis.patch.yml`、`package.json`、`locale/`、`icon.svg`、`README.md`），逐文件「临时文件 + rename」原子写入；`.git`、`node_modules`、数据文件一律不动。替换中途失败自动用备份回滚，并移除刚新增的文件。
+7. **标记待重启**：写 `<dataDir>/updates/state.json`（`pendingVersion` / `restartRequired: true`）。**插件不会自动重启宿主**——需要你重启 DSH 加载新版本；运行版本追上 `pendingVersion` 后下次启动自动清除标记。
+
+安全边界：更新只动插件自身安装目录（替换前校验该目录 `package.json` 的 `name` 匹配，否则拒绝）与 `<dataDir>/updates/`；绝不写 `~/.dsh/storages/`、profile 配置或用户数据；下载/解包/校验任何一步失败都不改安装目录，返回结构化 `{applied:false, error}`。低于当前版本默认拒绝（`--force` 可强制重装/降级）。
+
+## 配置命令 / 本地管理页（不依赖 DSH Agent）
+
+插件自带 CLI `bin/dsh-sync.mjs`（零依赖，`node bin/dsh-sync.mjs <命令>`；npm 安装后是 `dsh-sync` 命令）与本地管理页（`http://127.0.0.1:<listenPort>/admin`），让你不改 DSH 配置文件就能管理插件。
+
+CLI 自动定位插件目录与数据目录（`DSH_SYNC_HOME` 环境变量可覆盖，默认 `<dshHome>/plugin-sync`），优先调用运行中的管理 API；**DSH 没在运行时配置命令自动回退为直接读写 `config.json`** 并提示「需重载/重启生效」，`update` 命令则直接下载替换（同样重启后生效）。
+
+```bash
+dsh-sync status                                    # 完整状态；服务未运行时给本地摘要
+dsh-sync config get [key]                          # 查看配置（token 打码）
+dsh-sync config set '{"deviceName":"laptop"}'      # 深合并写入
+dsh-sync config add-peer desktop http://192.168.1.5:8789 <token>
+dsh-sync config remove-peer desktop
+dsh-sync config set-token                          # 省略参数则生成随机 token
+dsh-sync config set-remap '/Users/a/Projects' '/home/b/Projects'
+dsh-sync config remove-remap 0
+dsh-sync sync                                      # 触发一轮同步（需要服务在运行）
+dsh-sync update check                              # 检查 GitHub 最新版本
+dsh-sync update apply [--version vX.Y.Z] [--force] # 应用更新（默认最新版）
+dsh-sync version / help
+```
+
+本地管理页：DSH 运行时浏览器打开 `http://127.0.0.1:<端口>/admin`（token 留空时服务只绑回环，请先 `dsh-sync config set-token` 设置 token）。单文件内联 HTML，无外部资源；可查看状态、编辑配置（JSON）、立即同步、检查/应用更新。token 输入一次后存 localStorage，仅本浏览器可见。
+
+**管理端安全说明**：`/admin` 与 `/v1/admin/*` 只接受本机回环来源（`127.0.0.1`/`::1`，按 socket 真实地址判定，不信任转发头），且必须携带与同步 token 相同的 `x-dsh-sync-token`（浏览器场景允许 `?token=` 查询参数）——否则 403/401；所有响应 `cache-control: no-store`。token 为空时管理 API 一律 401（先设置 token 再用）。API 一览：
+
+| 方法与路径 | 说明 |
+|---|---|
+| `GET /admin` | 管理页 HTML |
+| `GET /v1/admin/status` | `dsh_sync_status` 同源状态（含 `installedVersion` / `update`） |
+| `GET /v1/admin/config` | 当前设置（token 打码） |
+| `PUT /v1/admin/config` | body `{"set":{…}}` 深合并写入，返回 `{settings, needRestart}` |
+| `POST /v1/admin/sync` | 异步触发一轮同步，返回 `{started:true}` 或 `{started:false, reason:'inFlight'}` |
+| `GET /v1/admin/update/check` | 检查更新（GitHub） |
+| `POST /v1/admin/update/apply` | body `{version?, force?}`，默认最新版；成功后需重启 DSH |
+
 ## 日志与排查
 
 - 追加日志：`<dshHome>/plugin-sync/logs/sync.log`，超过 2MB 轮转为 `sync.log.1`。日志文件本身被符号链接/硬链接劫持、或 `storages` 为危险配置时，追加与轮转被 safe-writer 拒绝，拒绝信息计入本轮 `errors[]`（不再静默）。
@@ -226,6 +282,9 @@ node tests/engine.offline.test.mjs    # 沙箱补充：真实文件与周期，�
 node tests/fixture.accept.test.mjs    # 读取 /tmp/dsh-sync-accept 两份事故 fixture，在仓库临时目录合并
 node tests/security.symlink.test.mjs  # 14 组攻击：符号链接/硬链接/目录污染/故障注入，宿主字节不变、零写系统调用
 node tests/registry.test.mjs          # v1.2 registry 应用：12 组场景（命中/幂等/stat缺失/缺目录/archive-pin/标题/逐API故障注入/降级/异常 + v1.2.2 先坏后好/重复轮幂等）+ engine/index 接入，纯 mock
+node tests/update.test.mjs            # v1.4.0 自更新：check 404 回退/无更新/网络错误、apply 替换/包校验/tar 越界拒绝/超限/回滚/备份还原/pending（mock fetch + 临时目录）
+node tests/admin.test.mjs             # v1.4.0 管理端：401/403 鉴权顺序、HTML、config/sync/update 路由、no-store、engine 接线与 pending 清除
+node tests/cli.test.mjs               # v1.4.0 CLI 冒烟：version/help/status/config get/set/add-peer/remove-peer/set-token/set-remap/remove-remap（临时 DSH_SYNC_HOME）
 ```
 
 各测试成功均输出 `ALL PASS`；HTTP 测试需要允许本机端口监听。
