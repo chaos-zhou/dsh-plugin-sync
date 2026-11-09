@@ -5,7 +5,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { mergeWorkspace, validateWorkspaceDoc } from '../lib/workspace.js'
 
-const source = '/tmp/dsh-sync-accept'
+const source = fileURLToPath(new URL('./fixtures/', import.meta.url))
 const localSource = path.join(source, 'workspace.local.json')
 const stagingSource = path.join(source, 'workspace.staging.json')
 const [localBytes, remoteBytes] = await Promise.all([fsp.readFile(localSource), fsp.readFile(stagingSource)])

@@ -315,7 +315,7 @@ test('攻击6 attachments 父级符号链接→storages：apply 拒绝，宿主�
 // ── 攻击 7：真实事故 fixture（proposal 输出合法、宿主字节不变、initialized 保留、
 // 本地递归键不缩减、sessionIds 并集）──
 test('攻击7 真实事故fixture：合并输出合法且宿主字节不变', async () => {
-  const source = '/tmp/dsh-sync-accept'
+  const source = fileURLToPath(new URL('./fixtures/', import.meta.url))
   const localBytes = await fsp.readFile(path.join(source, 'workspace.local.json'))
   const remoteBytes = await fsp.readFile(path.join(source, 'workspace.staging.json'))
   const local = JSON.parse(localBytes.toString('utf8'))

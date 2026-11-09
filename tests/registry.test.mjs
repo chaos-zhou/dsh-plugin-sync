@@ -805,8 +805,9 @@ try {
   // ---- v1.3.0：映射只在 registry applier 使用路径时做一次（合并阶段不映射） ----
   {
     const quiet = { info: async () => {}, warn: async () => {}, error: async () => {} }
-    const rawPath = 'C:\\Users\\peer\\Documents\\deepseek-harness\\default-workspace'
-    const mappedPath = '/home/user/Documents/deepseek-harness/default-workspace'
+    const rawPath = 'C:\\Users\\peer'
+    const mappedPath = path.join(home, 'mapped-workspace')
+    await fsp.mkdir(mappedPath, { recursive: true })
     const state = {
       byPath: new Map([[mappedPath, { id: 'w1', path: mappedPath, title: 't', sessionIds: [] }]]),
       sessions: new Set(['s1', 's2']),
@@ -816,7 +817,7 @@ try {
     const registry = mockRegistry(state)
     const persistence = mockSessionPersistence(state.sessions)
     const d = doc({ w1: { path: rawPath, title: 't', sessionIds: ['s1', 's2'], createdAt: '2026-01-01T00:00:00Z', updatedAt: '2026-01-01T00:00:00Z' } })
-    const remap = [{ from: 'C:\\Users\\peer', to: '/home/user' }]
+    const remap = [{ from: 'C:\\Users\\peer', to: mappedPath }]
     const first = await applyRegistryIndex({ registry, sessionPersistence: persistence, doc: d, pathRemap: remap, log: quiet })
     assert.equal(first.error, null)
     assert.deepEqual(registry.calls.resolveByPath, [mappedPath], 'resolveByPath 收到映射后的本机路径')
@@ -835,7 +836,7 @@ try {
     // 非法规则：整组禁用 + 零 mutation
     const state2 = { byPath: new Map(), sessions: new Set(['s1']), archived: new Set(), pinned: new Set() }
     const reg2 = mockRegistry(state2)
-    const bad = await applyRegistryIndex({ registry: reg2, sessionPersistence: mockSessionPersistence(state2.sessions), doc: d, pathRemap: [{ from: 'relative/path', to: '/home/user' }], log: quiet })
+    const bad = await applyRegistryIndex({ registry: reg2, sessionPersistence: mockSessionPersistence(state2.sessions), doc: d, pathRemap: [{ from: 'relative/path', to: path.join(home, 'x') }], log: quiet })
     assert.equal(reg2.calls.create.length, 0, '非法规则 → 零 create')
     assert.equal(reg2.calls.attach.length, 0, '非法规则 → 零 attach')
     assert.ok(bad.registryWarnings.length > 0, '非法规则产生可见 warning')
