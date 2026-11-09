@@ -17,7 +17,7 @@ const pkg = JSON.parse(await fsp.readFile(fileURLToPath(new URL('../package.json
 
 // 预置：listenPort=0（端口 0 不可连接，fetch 直接失败 → CLI 回退本地读写）
 await fsp.mkdir(dshSyncHome, { recursive: true })
-await fsp.writeFile(configFile, JSON.stringify({ listenPort: 0 }))
+await fsp.writeFile(configFile, JSON.stringify({ listenPort: 43219 }))
 
 function run(args, extraEnv = {}) {
   const r = spawnSync(process.execPath, [bin, ...args], {
@@ -47,7 +47,7 @@ try {
   const g0 = run(['config', 'get'])
   assert.equal(g0.code, 0, g0.stderr)
   const settings0 = JSON.parse(g0.stdout)
-  assert.equal(settings0.listenPort, 0)
+  assert.equal(settings0.listenPort, 43219)
   assert.equal(settings0.role, 'peer')
   console.log('cli S2 config get 输出默认设置 PASS')
 
@@ -59,7 +59,7 @@ try {
   assert.equal(saved.deviceName, 'cli-test')
   assert.equal(saved.token, 'abc123')
   assert.equal(saved.intervalSec, 45)
-  assert.equal(saved.listenPort, 0, '未设置字段保留原值')
+  assert.equal(saved.listenPort, 43219, '未设置字段保留原值')
 
   const g1 = run(['config', 'get', 'token'])
   assert.equal(g1.code, 0)
@@ -141,7 +141,7 @@ try {
   const stJson = JSON.parse(st.stdout)
   assert.equal(stJson.installedVersion, pkg.version)
   assert.equal(stJson.deviceName, 'cli-test')
-  assert.equal(stJson.listenPort, 0)
+  assert.equal(stJson.listenPort, 43219)
   console.log('cli S6 status 服务未运行回退本地摘要 PASS')
 
   // sync：服务未运行 → 非零退出并说明原因

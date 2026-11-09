@@ -206,7 +206,7 @@ async function testServerUnit() {
     assert.equal(cfg0.json.settings.intervalSec, 300)
 
     // v1.4.1（B6）：保存入口 sanitize——打码 token 不回写（只改 intervalSec）
-    const cfgPut = await call('/v1/admin/config', { method: 'PUT', token: TOKEN, body: JSON.stringify({ set: { intervalSec: 60, token: 'admin********' } }) })
+    const cfgPut = await call('/v1/admin/config', { method: 'PUT', token: TOKEN, body: JSON.stringify({ set: { intervalSec: 60, token: 'admi****' } }) })
     assert.equal(cfgPut.status, 200)
     assert.equal(cfgPut.json.settings.intervalSec, 60)
     assert.ok(cfgPut.json.settings.token.includes('********'), 'token 打码')

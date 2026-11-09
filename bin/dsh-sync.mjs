@@ -75,7 +75,7 @@ async function installedVersion() {
 
 // 连接建立前失败（请求未送达、不可能有副作用）——可安全回退离线模式。
 // ECONNREFUSED 是典型；EADDRNOTAVAIL（如 listenPort=0）/ENOTFOUND 等同属此类。
-const PRE_CONNECT_CODES = new Set(['ECONNREFUSED', 'EADDRNOTAVAIL', 'ENOTFOUND', 'EACCES', 'EHOSTUNREACH', 'ENETUNREACH'])
+const PRE_CONNECT_CODES = new Set(['ECONNREFUSED'])
 
 // 返回 null 仅表示「连接建立前失败」——可安全回退离线模式。
 // v1.4.1（B3）：请求已发出后的超时/断连视为「结果未知」，直接报错而不是回退离线重试
@@ -317,7 +317,7 @@ async function main() {
       try {
         patch = JSON.parse(json)
       } catch (e) {
-        throw new Error(`JSON 解析失败：${e.message}`)
+        throw new Error('JSON 解析失败（请检查输入语法）')
       }
       if (!isPlainObject(patch)) throw new Error('set 参数必须是 JSON 对象')
       await mutateConfig(patch, '配置写入')
