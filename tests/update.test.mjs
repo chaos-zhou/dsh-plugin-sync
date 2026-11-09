@@ -1,5 +1,8 @@
 // v1.4.0 自更新单元测试：mock fetchImpl + tests/.tmp 临时目录，不触网、不碰真实 ~/.dsh。
+// v1.4.1 增补：B1 备份目录独占/链接预置拒绝、B2 复核失败回滚+mode+backupDir、B3 并发锁、
+// B4 gzip 炸弹与元数据头计数、N3 latestTag/无 v 前缀 tag 下载。
 import assert from 'node:assert/strict'
+import crypto from 'node:crypto'
 import fsp from 'node:fs/promises'
 import path from 'node:path'
 import zlib from 'node:zlib'
@@ -104,6 +107,7 @@ try {
 
   const ok = await checkUpdate({ repo: 'chaos-zhou/dsh-plugin-sync', currentVersion: '1.4.0', fetchImpl: async () => jsonRes({ tag_name: 'v1.5.0', html_url: 'https://github.com/chaos-zhou/dsh-plugin-sync/releases/tag/v1.5.0' }) })
   assert.equal(ok.latest, '1.5.0')
+  assert.equal(ok.latestTag, 'v1.5.0', 'latestTag 保留原始 tag（N3）')
   assert.equal(ok.available, true)
   assert.equal(ok.error, null)
   assert.ok(ok.notesUrl.includes('releases'))
@@ -119,6 +123,7 @@ try {
   assert.equal(calls.length, 2)
   assert.ok(calls[1].includes('/tags'))
   assert.equal(fallback.latest, '1.10.0')
+  assert.equal(fallback.latestTag, 'v1.10.0')
   assert.equal(fallback.available, true)
   assert.ok(fallback.notesUrl.includes('/releases/tag/v1.10.0'))
   console.log('update A2 releases 404 回退 tags 取最大 semver PASS')
@@ -323,6 +328,215 @@ try {
     const res = await applyUpdate({ repo: 'chaos-zhou/dsh-plugin-sync', version: '1.4.0', installRoot, dataDir, fetchImpl: async () => new Response(tgz) })
     assert.ok(res.error && /不安全/.test(res.error), '含 .. 的目录条目必须被拒绝')
     console.log('update D5 目录条目含 .. 仍拒绝 PASS')
+  }
+
+  // H. v1.4.1（B1）：备份目录名被预置为符号链接/重名目录 → 独占创建失败、拒绝更新，宿主文件字节不变
+  {
+    await makeInstall()
+    const updatesDir = path.join(dataDir, 'updates')
+    await fsp.mkdir(updatesDir, { recursive: true })
+    const hostFile = path.join(home, 'host-secret.txt')
+    await fsp.writeFile(hostFile, 'HOST-SECRET-BYTES')
+    const realRandomBytes = crypto.randomBytes
+    const realNow = Date.now
+    const presetName = 'backup-1.3.2-1750000000000-cdcdcdcdcdcdcdcd'
+    const presetPath = path.join(updatesDir, presetName)
+    crypto.randomBytes = () => Buffer.alloc(8, 0xcd)
+    Date.now = () => 1750000000000
+    let linked
+    try {
+      await fsp.symlink(hostFile, presetPath)
+      linked = await apply()
+    } finally {
+      crypto.randomBytes = realRandomBytes
+      Date.now = realNow
+    }
+    assert.equal(linked.applied, false)
+    assert.ok(linked.error.includes('备份目录创建失败'), linked.error)
+    assert.equal(linked.backupDir, null, '备份阶段失败不留备份目录')
+    assert.equal(await fsp.readFile(hostFile, 'utf8'), 'HOST-SECRET-BYTES', '预置符号链接的宿主目标字节不变')
+    assert.equal(await read('index.js'), 'OLD-INDEX', '备份阶段失败安装目录不变')
+    await fsp.rm(presetPath)
+
+    // 重名普通目录（含哨兵文件）同样拒绝，且目录内容不被破坏
+    await fsp.mkdir(presetPath, { recursive: true })
+    await fsp.writeFile(path.join(presetPath, 'sentinel.txt'), 'DO-NOT-TOUCH')
+    crypto.randomBytes = () => Buffer.alloc(8, 0xcd)
+    Date.now = () => 1750000000000
+    let dup
+    try {
+      dup = await apply()
+    } finally {
+      crypto.randomBytes = realRandomBytes
+      Date.now = realNow
+    }
+    assert.equal(dup.applied, false)
+    assert.ok(dup.error.includes('备份目录创建失败'), dup.error)
+    assert.equal(await fsp.readFile(path.join(presetPath, 'sentinel.txt'), 'utf8'), 'DO-NOT-TOUCH', '重名目录内容不变')
+    assert.equal(await read('index.js'), 'OLD-INDEX')
+    await fsp.rm(presetPath, { recursive: true, force: true })
+    console.log('update H1（B1）备份目录被预置为符号链接/重名时拒绝且宿主文件不变 PASS')
+  }
+
+  // 正常成功路径备份目录权限：0o700 独占
+  {
+    await makeInstall()
+    const res = await apply()
+    assert.equal(res.applied, true, res.error)
+    const st = await fsp.stat(res.backupDir)
+    assert.equal(st.mode & 0o7777, 0o700, '备份目录权限 0o700')
+    console.log('update H2（B1）备份目录以 0o700 独占创建 PASS')
+  }
+
+  // I. v1.4.1（B2）：rename 后复核失败（内容已落盘但报错）也能回滚——旧内容+mode 保留、新增清理、无 pending
+  {
+    await makeInstall()
+    await fsp.chmod(path.join(installRoot, 'lib/engine.js'), 0o755)
+    await fsp.rm(path.join(dataDir, 'updates/state.json'), { force: true })
+    const libDir = path.join(installRoot, 'lib')
+    const realRealpath = fsp.realpath
+    let calls = 0
+    // realpath(installRoot/lib) 只出现在对 lib/* 文件 guardedWrite 的写后复核阶段；
+    // 跳过第 1 次（lib/update.js 复核），注入第 2 次（lib/engine.js 复核）→ 该文件 rename 后报错。
+    fsp.realpath = async (p, ...args) => {
+      if (p === libDir && calls++ === 1) throw new Error('injected realpath failure')
+      return realRealpath(p, ...args)
+    }
+    const tgz = buildTgz([
+      { name: 'pkg/package.json', data: Buffer.from(JSON.stringify({ name: 'dsh-plugin-sync', version: '1.4.0' })) },
+      { name: 'pkg/index.js', data: Buffer.from('NEW-INDEX') },
+      { name: 'pkg/lib/update.js', data: Buffer.from('NEW-UPDATE') },
+      { name: 'pkg/lib/engine.js', data: Buffer.from('NEW-ENGINE') },
+    ])
+    let res
+    try {
+      res = await applyUpdate({ repo: 'chaos-zhou/dsh-plugin-sync', version: '1.4.0', installRoot, dataDir, fetchImpl: async () => new Response(tgz) })
+    } finally {
+      fsp.realpath = realRealpath
+    }
+    assert.equal(res.applied, false)
+    assert.ok(res.error.includes('engine.js'), res.error)
+    assert.equal(res.backupDir, null, '回滚完整 → 不保留备份目录')
+    assert.equal(await read('index.js'), 'OLD-INDEX')
+    assert.equal(await read('lib/engine.js'), 'OLD-ENGINE', 'rename 后复核失败的文件也被回滚（先登记再写）')
+    const mode = (await fsp.stat(path.join(installRoot, 'lib/engine.js'))).mode & 0o7777
+    assert.equal(mode, 0o755, '回滚保留原 mode（可执行位）')
+    await assert.rejects(fsp.access(path.join(installRoot, 'lib/update.js')), '新增文件被清理')
+    const st = await readUpdateState({ dataDir })
+    assert.ok(!st?.pendingVersion, '失败不写 pending')
+    console.log('update I1（B2）rename 后复核失败：回滚旧内容+mode、新增清理、无 pending PASS')
+  }
+
+  // J. v1.4.1（B2）：回滚本身失败 → 返回 backupDir（非 null）并在 error 中列出问题，便于人工恢复
+  {
+    await makeInstall()
+    await fsp.chmod(path.join(installRoot, 'lib/engine.js'), 0o755)
+    await fsp.rm(path.join(dataDir, 'updates/state.json'), { force: true })
+    const libDir = path.join(installRoot, 'lib')
+    const realRealpath = fsp.realpath
+    fsp.realpath = async (p, ...args) => {
+      if (p === libDir) throw new Error('injected realpath failure (persistent)')
+      return realRealpath(p, ...args)
+    }
+    const tgz = buildTgz([
+      { name: 'pkg/package.json', data: Buffer.from(JSON.stringify({ name: 'dsh-plugin-sync', version: '1.4.0' })) },
+      { name: 'pkg/lib/engine.js', data: Buffer.from('NEW-ENGINE') },
+    ])
+    let res
+    try {
+      res = await applyUpdate({ repo: 'chaos-zhou/dsh-plugin-sync', version: '1.4.0', installRoot, dataDir, fetchImpl: async () => new Response(tgz) })
+    } finally {
+      fsp.realpath = realRealpath
+    }
+    assert.equal(res.applied, false)
+    assert.ok(res.backupDir, '回滚失败必须返回 backupDir 供人工恢复')
+    assert.ok(res.error.includes('回滚未完成'), res.error)
+    assert.ok(res.error.includes('engine.js'), res.error)
+    const backupEngine = await fsp.readFile(path.join(res.backupDir, 'lib/engine.js'), 'utf8')
+    assert.equal(backupEngine, 'OLD-ENGINE', '备份目录保留旧内容供人工恢复')
+    const manifest = JSON.parse(await fsp.readFile(path.join(res.backupDir, 'manifest.json'), 'utf8'))
+    assert.ok(manifest.replaced.includes('lib/engine.js'))
+    await fsp.rm(res.backupDir, { recursive: true, force: true })
+    console.log('update J1（B2）回滚失败返回 backupDir+问题清单 PASS')
+  }
+
+  // K. v1.4.1（B3）：双次并发 apply → 一个成功、一个被跨进程锁拒绝；结束后锁文件删除
+  {
+    await makeInstall()
+    await fsp.rm(path.join(dataDir, 'updates/state.json'), { force: true })
+    const slowFetch = async () => {
+      await new Promise((r) => setTimeout(r, 80))
+      return new Response(NEW_TGZ())
+    }
+    const base = { repo: 'chaos-zhou/dsh-plugin-sync', version: '1.4.0', installRoot, dataDir }
+    const [a, b] = await Promise.all([
+      applyUpdate({ ...base, fetchImpl: slowFetch }),
+      applyUpdate({ ...base, fetchImpl: slowFetch }),
+    ])
+    const winners = [a, b].filter((r) => r.applied)
+    const locked = [a, b].filter((r) => !r.applied && r.error.includes('已有更新在进行'))
+    assert.equal(winners.length, 1, `恰好一个成功：${JSON.stringify([a.error, b.error])}`)
+    assert.equal(locked.length, 1, '另一个被锁拒绝')
+    assert.equal(await read('index.js'), 'NEW-INDEX', '成功者正常完成替换')
+    await assert.rejects(fsp.access(path.join(dataDir, 'updates', '.lock')), '锁文件在 finally 中删除')
+    const st = await readUpdateState({ dataDir })
+    assert.equal(st.pendingVersion, '1.4.0')
+    console.log('update K1（B3）并发 apply 互斥：一个成功一个拒绝、锁清理 PASS')
+  }
+
+  // L. v1.4.1（B4）：gzip 炸弹（小压缩包解压 >64MiB）被 maxOutputLength 拒绝且零副作用
+  {
+    await makeInstall()
+    const freshDataDir = path.join(home, 'dsh-bomb/plugin-sync')
+    const big = Buffer.alloc(65 * 1024 * 1024, 0)
+    const bomb = zlib.gzipSync(buildTar([{ name: 'pkg/big.bin', data: big }]))
+    assert.ok(bomb.length < 1024 * 1024, '压缩包本身很小（炸弹形态）')
+    const res = await applyUpdate({ repo: 'chaos-zhou/dsh-plugin-sync', version: '1.4.0', installRoot, dataDir: freshDataDir, fetchImpl: async () => new Response(bomb) })
+    assert.equal(res.applied, false)
+    assert.ok(res.error.includes('gzip'), res.error)
+    assert.ok(res.error.includes('上限'), res.error)
+    assert.equal(res.backupDir, null, '解压阶段失败不建备份')
+    assert.equal(await read('index.js'), 'OLD-INDEX', 'gzip 炸弹零副作用')
+    console.log('update L1（B4）gzip 炸弹拒绝且零副作用 PASS')
+  }
+
+  // M. v1.4.1（B4）：L/x/g/K 等所有 tar 头（含元数据头）计入条目上限
+  {
+    await makeInstall()
+    const many = []
+    for (let i = 0; i < 2001; i++) many.push({ name: `hdr-${i}`, type: 'g', data: Buffer.from('x') })
+    many.push({ name: 'pkg/package.json', data: Buffer.from(JSON.stringify({ name: 'dsh-plugin-sync', version: '1.4.0' })) })
+    const res = await apply({ fetchImpl: async () => new Response(buildTgz(many)) })
+    assert.equal(res.applied, false)
+    assert.ok(res.error.includes('上限'), res.error)
+    assert.equal(await read('index.js'), 'OLD-INDEX')
+    console.log('update M1（B4）元数据头计入条目上限（2001 个 g 头拒绝）PASS')
+  }
+
+  // N. v1.4.1（N3）：无 v 前缀 tag 也可下载——下载 URL 使用传入 tag；缺省仍为 v{version}
+  {
+    await makeInstall()
+    const urls = []
+    const tgz = buildTgz([
+      { name: 'dsh-plugin-sync-1.6.1/package.json', data: Buffer.from(JSON.stringify({ name: 'dsh-plugin-sync', version: '1.6.1' })) },
+      { name: 'dsh-plugin-sync-1.6.1/index.js', data: Buffer.from('TAG-NOV') },
+    ])
+    const res = await applyUpdate({ repo: 'chaos-zhou/dsh-plugin-sync', version: '1.6.1', tag: '1.6.1', installRoot, dataDir, fetchImpl: async (url) => { urls.push(String(url)); return new Response(tgz) } })
+    assert.equal(res.applied, true, res.error)
+    assert.ok(urls[0].includes('/refs/tags/1.6.1'), `下载 URL 用原始 tag：${urls[0]}`)
+    assert.ok(!urls[0].includes('/refs/tags/v1.6.1'))
+    assert.equal(await read('index.js'), 'TAG-NOV')
+
+    await makeInstall('1.6.1')
+    const urls2 = []
+    const tgz2 = buildTgz([
+      { name: 'dsh-plugin-sync-1.6.2/package.json', data: Buffer.from(JSON.stringify({ name: 'dsh-plugin-sync', version: '1.6.2' })) },
+      { name: 'dsh-plugin-sync-1.6.2/index.js', data: Buffer.from('TAG-DEFAULT-V') },
+    ])
+    const res2 = await applyUpdate({ repo: 'chaos-zhou/dsh-plugin-sync', version: '1.6.2', installRoot, dataDir, fetchImpl: async (url) => { urls2.push(String(url)); return new Response(tgz2) } })
+    assert.equal(res2.applied, true, res2.error)
+    assert.ok(urls2[0].includes('/refs/tags/v1.6.2'), `缺省 tag = v{version}：${urls2[0]}`)
+    console.log('update N1（N3）无 v 前缀 tag 下载/缺省 v{version} PASS')
   }
 
   console.log('ALL PASS（lib/update.js：checkUpdate/applyUpdate/安全解包/备份回滚/pending）')

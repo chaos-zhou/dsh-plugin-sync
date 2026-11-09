@@ -4,13 +4,14 @@
 // 安装目录操作全部指向 tests/.tmp 临时目录，绝不触碰真实仓库文件与 ~/.dsh。
 import assert from 'node:assert/strict'
 import fsp from 'node:fs/promises'
+import http from 'node:http'
 import path from 'node:path'
 import zlib from 'node:zlib'
 import { PassThrough } from 'node:stream'
 import { fileURLToPath } from 'node:url'
 import { createSyncServer, listen, closeServer } from '../lib/server.js'
 import { createEngine } from '../lib/engine.js'
-import { DEFAULTS, deepMerge, publicSettings } from '../lib/config.js'
+import { DEFAULTS, deepMerge, publicSettings, sanitizeConfigSet } from '../lib/config.js'
 import { checkUpdate, applyUpdate } from '../lib/update.js'
 
 const tmpRoot = fileURLToPath(new URL('./.tmp/', import.meta.url))
@@ -50,6 +51,26 @@ function buildTgz(entries) {
 }
 const jsonRes = (obj, status = 200) => new Response(JSON.stringify(obj), { status, headers: { 'content-type': 'application/json' } })
 
+// B5 用例辅助：伪造 socket/headers 直接 emit request（真实回环连接无法伪造 remoteAddress/Host）
+async function fakeRequest(server, { method = 'GET', url = '/v1/admin/status', headers = {}, remoteAddress = '127.0.0.1' }) {
+  const req = new PassThrough()
+  req.method = method
+  req.url = url
+  req.headers = headers
+  req.socket = { remoteAddress }
+  let code = null
+  let body = ''
+  await new Promise((resolve) => {
+    const res = {
+      writeHead(c, h) { code = c; return res },
+      end(b) { body = String(b ?? ''); resolve() },
+      setHeader() {},
+    }
+    server.emit('request', req, res)
+  })
+  return { code, body }
+}
+
 // ---- 第一段：server 单元层 ----
 async function testServerUnit() {
   let settings = deepMerge(DEFAULTS, { token: TOKEN, intervalSec: 300 })
@@ -67,7 +88,8 @@ async function testServerUnit() {
     admin: {
       getStatus: async () => ({ ok: true, note: 'unit-status' }),
       getConfig: async () => ({ settings: publicSettings(settings), needRestart: false }),
-      putConfig: async (set) => { settings = deepMerge(settings, set); return { settings: publicSettings(settings), needRestart: false } },
+      // v1.4.1（B6）：与 engine.updateSettings 同构——保存入口先 sanitize。
+      putConfig: async (set) => { settings = deepMerge(settings, sanitizeConfigSet(set, settings)); return { settings: publicSettings(settings), needRestart: false } },
       triggerSync: async () => {
         if (inFlight) return { started: false, reason: 'inFlight' }
         inFlight = true
@@ -95,12 +117,13 @@ async function testServerUnit() {
   const server = createSyncServer(ops)
   const port = await listen(server, 0, '127.0.0.1')
   const base = `http://127.0.0.1:${port}`
-  const call = async (pathname, { method = 'GET', token, body } = {}) => {
-    const res = await fetch(base + pathname, {
-      method,
-      headers: { ...(token !== undefined ? { 'x-dsh-sync-token': token } : {}), ...(body ? { 'content-type': 'application/json' } : {}) },
-      body,
-    })
+  const call = async (pathname, { method = 'GET', token, body, ct, origin } = {}) => {
+    const headers = { ...(token !== undefined ? { 'x-dsh-sync-token': token } : {}) }
+    if (body !== undefined) {
+      if (ct !== null) headers['content-type'] = ct || 'application/json'
+    }
+    if (origin) headers.origin = origin
+    const res = await fetch(base + pathname, { method, headers, body })
     const text = await res.text()
     let json = null
     try { json = JSON.parse(text) } catch {}
@@ -108,8 +131,8 @@ async function testServerUnit() {
   }
 
   try {
-    // 鉴权：HTML 页与 API 无 token/错 token → 401
-    for (const [p, t] of [['/admin', undefined], ['/admin', 'wrong'], ['/v1/admin/status', undefined], ['/v1/admin/status', 'wrong']]) {
+    // 鉴权（v1.4.1 B5）：/v1/admin/* 无 token/错 token → 401；GET /admin 页面免 token（仅回环）
+    for (const [p, t] of [['/v1/admin/status', undefined], ['/v1/admin/status', 'wrong']]) {
       const r = await call(p, { token: t })
       assert.equal(r.status, 401, `${p} token=${t}`)
       assert.equal(r.headers.get('cache-control'), 'no-store')
@@ -121,7 +144,7 @@ async function testServerUnit() {
       const req = new PassThrough()
       req.method = 'GET'
       req.url = '/v1/admin/status'
-      req.headers = { 'x-dsh-sync-token': TOKEN }
+      req.headers = { 'x-dsh-sync-token': TOKEN, host: `127.0.0.1:${port}` }
       req.socket = { remoteAddress: '192.168.1.50' }
       let code = null
       const done = new Promise((resolve) => {
@@ -132,17 +155,45 @@ async function testServerUnit() {
       await closeServer(server2)
     }
 
-    // HTML 页
-    const page = await call('/admin', { token: TOKEN })
+    // v1.4.1（B5）：恶意 Host 拒绝（socket 回环 + token 正确也 403，防 DNS rebinding）
+    {
+      const server2 = createSyncServer({ token: () => TOKEN, admin: { getStatus: async () => ({ ok: true }) } })
+      const evil = await fakeRequest(server2, { headers: { 'x-dsh-sync-token': TOKEN, host: 'evil.example.com:80' } })
+      assert.equal(evil.code, 403, '非回环 Host 必须 403')
+      const evilPage = await fakeRequest(server2, { url: '/admin', headers: { host: 'evil.example.com' } })
+      assert.equal(evilPage.code, 403, 'GET /admin 也要求回环 Host')
+      const goodPage = await fakeRequest(server2, { url: '/admin', headers: { host: '127.0.0.1:8789' } })
+      assert.equal(goodPage.code, 200, '回环 Host 的页面 200（免 token）')
+      const localhostHost = await fakeRequest(server2, { headers: { 'x-dsh-sync-token': TOKEN, host: 'localhost:8789' } })
+      assert.equal(localhostHost.code, 200, 'localhost Host 视为回环')
+      await closeServer(server2)
+    }
+
+    // HTML 页（v1.4.1 B5：免 token）
+    const page = await call('/admin')
     assert.equal(page.status, 200)
     assert.ok(page.headers.get('content-type').includes('text/html'))
     assert.equal(page.headers.get('cache-control'), 'no-store')
-    for (const keyword of ['本地管理', '状态', '配置', '立即同步', '检查更新', '应用更新', '重启 DSH', 'localStorage']) {
+    for (const keyword of ['本地管理', '状态', '配置', '立即同步', '检查更新', '应用更新', '重启 DSH', 'localStorage', '打码']) {
       assert.ok(page.text.includes(keyword), `HTML 缺少关键文案：${keyword}`)
     }
-    // query token（浏览器无法设自定义头，允许 ?token=）
+    // v1.4.1（B5）：query token 一律拒绝——页面免 token 是特例，API 必须走头
     const pageQuery = await call('/admin?token=' + TOKEN)
-    assert.equal(pageQuery.status, 200)
+    assert.equal(pageQuery.status, 200, '页面（免 token）不受 query token 影响')
+    const queryTokenApi = await call('/v1/admin/status?token=' + TOKEN)
+    assert.equal(queryTokenApi.status, 401, 'query token 不被接受')
+    const pageQueryApi = await fetch(base + '/v1/admin/status', { headers: { 'x-dsh-sync-token': TOKEN } })
+    assert.equal(pageQueryApi.status, 200, '头 token 正常')
+
+    // v1.4.1（B5）：非 GET 管理请求要求 content-type: application/json；跨站 Origin 403
+    const textPlain = await call('/v1/admin/sync', { method: 'POST', token: TOKEN, body: 'ping', ct: 'text/plain' })
+    assert.equal(textPlain.status, 415, 'text/plain POST 拒绝')
+    const noCt = await call('/v1/admin/sync', { method: 'POST', token: TOKEN, body: '{}', ct: null })
+    assert.equal(noCt.status, 415, '非 GET 无 content-type 拒绝')
+    const crossOrigin = await call('/v1/admin/sync', { method: 'POST', token: TOKEN, body: '{}', origin: 'https://evil.example.com' })
+    assert.equal(crossOrigin.status, 403, '跨站 Origin 拒绝')
+    const crossOriginApi = await call('/v1/admin/config', { method: 'PUT', token: TOKEN, body: JSON.stringify({ set: { intervalSec: 61 } }), origin: 'http://192.168.1.9:3000' })
+    assert.equal(crossOriginApi.status, 403, 'PUT 带非回环 Origin 同样拒绝')
 
     // status/config 路由
     const status = await call('/v1/admin/status', { token: TOKEN })
@@ -154,20 +205,22 @@ async function testServerUnit() {
     assert.equal(cfg0.status, 200)
     assert.equal(cfg0.json.settings.intervalSec, 300)
 
-    const cfgPut = await call('/v1/admin/config', { method: 'PUT', token: TOKEN, body: JSON.stringify({ set: { intervalSec: 60 } }) })
+    // v1.4.1（B6）：保存入口 sanitize——打码 token 不回写（只改 intervalSec）
+    const cfgPut = await call('/v1/admin/config', { method: 'PUT', token: TOKEN, body: JSON.stringify({ set: { intervalSec: 60, token: 'admin********' } }) })
     assert.equal(cfgPut.status, 200)
     assert.equal(cfgPut.json.settings.intervalSec, 60)
-    assert.ok(cfgPut.json.settings.token.includes('******'), 'token 打码')
+    assert.ok(cfgPut.json.settings.token.includes('********'), 'token 打码')
+    assert.equal(settings.token, TOKEN, '打码 token 未回写成真实值')
 
     const cfgBad = await call('/v1/admin/config', { method: 'PUT', token: TOKEN, body: JSON.stringify({ noSet: true }) })
     assert.equal(cfgBad.status, 400)
     const cfgBadJson = await call('/v1/admin/config', { method: 'PUT', token: TOKEN, body: '{broken' })
     assert.equal(cfgBadJson.status, 400)
 
-    // sync：started / inFlight
-    const sync1 = await call('/v1/admin/sync', { method: 'POST', token: TOKEN })
+    // sync：started / inFlight（带回环 Origin 的合法 JSON POST 应放行）
+    const sync1 = await call('/v1/admin/sync', { method: 'POST', token: TOKEN, body: '{}', origin: `http://127.0.0.1:${port}` })
     assert.deepEqual(sync1.json, { started: true })
-    const sync2 = await call('/v1/admin/sync', { method: 'POST', token: TOKEN })
+    const sync2 = await call('/v1/admin/sync', { method: 'POST', token: TOKEN, body: '{}' })
     assert.deepEqual(sync2.json, { started: false, reason: 'inFlight' })
     await new Promise((r) => setTimeout(r, 250))
 
@@ -209,8 +262,14 @@ async function testServerUnit() {
 // ---- 第二段：真实 engine 接线 ----
 async function testEngineIntegration() {
   const dshHome = path.join(home, 'engine-dsh')
+  const PEER_TOKEN = 'peer-secret-token-456789'
+  // 预置一个已关闭的本地端口作为不可达 peer：ECONNREFUSED 立即失败，runCycle 快速完成
+  const dead = http.createServer()
+  const deadPort = await new Promise((r) => { dead.listen(0, '127.0.0.1', () => r(dead.address().port)) })
+  await new Promise((r) => dead.close(() => r()))
   const makeEngine = () => createEngine({ rowConfig: {
     dshHome, deviceName: 'admin-engine', listenPort: 0, bindHost: '127.0.0.1', token: TOKEN, settleSec: 0,
+    peers: [{ name: 'p1', url: `http://127.0.0.1:${deadPort}`, token: PEER_TOKEN }],
   } })
   const engine = makeEngine()
   await engine.init()
@@ -220,13 +279,13 @@ async function testEngineIntegration() {
   const call = async (pathname, { method = 'GET', token = TOKEN, body } = {}) => {
     const res = await fetch(base + pathname, {
       method,
-      headers: { 'x-dsh-sync-token': token, ...(body ? { 'content-type': 'application/json' } : {}) },
+      headers: { 'x-dsh-sync-token': token, ...(body !== undefined ? { 'content-type': 'application/json' } : {}) },
       body,
     })
     const text = await res.text()
     let json = null
     try { json = JSON.parse(text) } catch {}
-    return { status: res.status, headers: res.headers, json }
+    return { status: res.status, headers: res.headers, text, json }
   }
 
   const originalFetch = globalThis.fetch
@@ -245,12 +304,35 @@ async function testEngineIntegration() {
     assert.equal(cfgPut.status, 200)
     assert.equal(cfgPut.json.settings.intervalSec, 61)
     assert.equal(cfgPut.json.needRestart, true, 'listenPort 变更标记 needRestart')
-    const persisted = JSON.parse(await fsp.readFile(path.join(dshHome, 'plugin-sync/config.json'), 'utf8'))
+    let persisted = JSON.parse(await fsp.readFile(path.join(dshHome, 'plugin-sync/config.json'), 'utf8'))
     assert.equal(persisted.intervalSec, 61)
     assert.equal(persisted.listenPort, 9999)
 
+    // v1.4.1（B7）：短 token 整体打码；peers[].token 打码；任何管理输出不出现完整 token
+    assert.equal(cfg0.json.settings.token, '********', '短 token（≤12）整体打码')
+    assert.ok(cfg0.text.includes('peer****'), 'peer token 打码展示')
+    assert.ok(!cfg0.text.includes(PEER_TOKEN), 'config 输出不含完整 peer token')
+    assert.equal(status.json.token, '********', 'status token 打码')
+    const stText = status.text
+    assert.ok(!stText.includes(TOKEN), 'status 不含完整 token')
+    assert.ok(!stText.includes(PEER_TOKEN), 'status 不含完整 peer token')
+
+    // v1.4.1（B6）端到端：加载（打码）→ 只改 intervalSec → 保存 → token/peers token 保持原值
+    const loaded = (await call('/v1/admin/config')).json.settings
+    assert.equal(loaded.token, '********')
+    assert.equal(loaded.peers[0].token, 'peer****')
+    const saveRes = await call('/v1/admin/config', { method: 'PUT', body: JSON.stringify({ set: { ...loaded, intervalSec: 77 } }) })
+    assert.equal(saveRes.status, 200)
+    persisted = JSON.parse(await fsp.readFile(path.join(dshHome, 'plugin-sync/config.json'), 'utf8'))
+    assert.equal(persisted.intervalSec, 77, '其他字段照常保存')
+    assert.equal(persisted.token, TOKEN, '顶层 token 保持原值')
+    assert.equal(persisted.peers[0].token, PEER_TOKEN, 'peers token 保持原值')
+    assert.equal(persisted.peers[0].url, `http://127.0.0.1:${deadPort}`, 'peer 其他字段保留')
+    const afterSave = await call('/v1/admin/status')
+    assert.equal(afterSave.status, 200, '保存后服务仍 200')
+
     // sync：触发后 lastRun 出现
-    const sync = await call('/v1/admin/sync', { method: 'POST' })
+    const sync = await call('/v1/admin/sync', { method: 'POST', body: '{}' })
     assert.deepEqual(sync.json, { started: true })
     for (let i = 0; i < 100 && !(await call('/v1/admin/status')).json.lastRun; i++) {
       await new Promise((r) => setTimeout(r, 50))
@@ -265,6 +347,7 @@ async function testEngineIntegration() {
     const check = await call('/v1/admin/update/check')
     assert.equal(check.status, 200)
     assert.equal(check.json.latest, '9.8.7')
+    assert.equal(check.json.latestTag, 'v9.8.7', 'check 返回原始 latestTag（N3）')
     assert.equal(check.json.available, true)
     const status2 = await call('/v1/admin/status')
     assert.equal(status2.json.update.latest, '9.8.7')
@@ -276,10 +359,21 @@ async function testEngineIntegration() {
     assert.equal(refused.json.applied, false)
     assert.ok(refused.json.error.includes('force'))
 
+    // v1.4.1（N1）：不带 version → 先 checkUpdate 取 latest 再 apply（latest 低于当前 → force 拒绝，
+    // 证明走了「默认最新」路径且不会触碰真实安装目录）
+    globalThis.fetch = async (url, init) => {
+      if (String(url).includes('api.github.com')) return jsonRes({ tag_name: 'v0.0.1' })
+      return originalFetch(url, init)
+    }
+    const defaultLatest = await call('/v1/admin/update/apply', { method: 'POST', body: '{}' })
+    assert.equal(defaultLatest.status, 200)
+    assert.equal(defaultLatest.json.applied, false)
+    assert.ok(defaultLatest.json.error.includes('force'), defaultLatest.json.error)
+
     // 无 token 的管理 API 仍 401（真实 engine 路径）
     const anon = await call('/v1/admin/status', { token: 'bad' })
     assert.equal(anon.status, 401)
-    console.log('admin U2 engine 接线：status/config 持久化/sync/检查/拒绝低版本 PASS')
+    console.log('admin U2 engine 接线：status/config 持久化/B6 打码不回写/B7 脱敏/sync/check/N1 默认 latest PASS')
   } finally {
     globalThis.fetch = originalFetch
     await engine.close()

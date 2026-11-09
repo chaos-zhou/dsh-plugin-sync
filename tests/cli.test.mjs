@@ -19,10 +19,10 @@ const pkg = JSON.parse(await fsp.readFile(fileURLToPath(new URL('../package.json
 await fsp.mkdir(dshSyncHome, { recursive: true })
 await fsp.writeFile(configFile, JSON.stringify({ listenPort: 0 }))
 
-function run(args) {
+function run(args, extraEnv = {}) {
   const r = spawnSync(process.execPath, [bin, ...args], {
     encoding: 'utf8',
-    env: { ...process.env, DSH_SYNC_HOME: dshSyncHome, DSH_HOME: path.join(home, 'dsh') },
+    env: { ...process.env, DSH_SYNC_HOME: dshSyncHome, DSH_HOME: path.join(home, 'dsh'), ...extraEnv },
     timeout: 30000,
   })
   return { code: r.status, stdout: r.stdout || '', stderr: r.stderr || '' }
@@ -63,13 +63,28 @@ try {
 
   const g1 = run(['config', 'get', 'token'])
   assert.equal(g1.code, 0)
-  // CLI 本地读取走 publicSettings 打码
-  assert.ok(g1.stdout.trim().startsWith('abc123'), g1.stdout)
+  // v1.4.1（B7）：CLI 本地读取走 publicSettings 打码；短 token（≤12）整体打码
+  assert.equal(g1.stdout.trim(), '********', g1.stdout)
 
   const g2 = run(['config', 'get', 'no-such-key'])
   assert.equal(g2.code, 1)
   assert.ok(g2.stderr.includes('不存在'))
   console.log('cli S3 config set 深合并持久化 / get key / 不存在报错 PASS')
+
+  // v1.4.1（B6）：CLI config set 携带打码 token → 视为「不修改」，不回写
+  const b6a = run(['config', 'set', '{"intervalSec":46,"token":"********"}'])
+  assert.equal(b6a.code, 0, b6a.stderr)
+  saved = await readConfig()
+  assert.equal(saved.intervalSec, 46)
+  assert.equal(saved.token, 'abc123', '打码 token 不回写')
+
+  // v1.4.1（B6）：空串 token 同样视为不修改
+  const b6b = run(['config', 'set', '{"settleSec":9,"token":""}'])
+  assert.equal(b6b.code, 0, b6b.stderr)
+  saved = await readConfig()
+  assert.equal(saved.settleSec, 9)
+  assert.equal(saved.token, 'abc123', '空串 token 不回写')
+  console.log('cli S3b（B6）打码/空 token 不回写 PASS')
 
   // peers 管理
   const a1 = run(['config', 'add-peer', 'MBP', 'http://192.168.1.5:8789', 'peer-tok'])
@@ -143,6 +158,55 @@ try {
   assert.equal(noArg.code, 1)
   assert.ok(noArg.stderr.includes('用法'))
   console.log('cli S8 未知命令/参数不足报错 PASS')
+
+  // v1.4.1（B7）：长 token 保留前 4 位打码；config get / status 全输出不含完整 token（含 peers）
+  const fullToken = (await readConfig()).token
+  assert.ok(fullToken.length >= 32, 'S5 已生成随机长 token')
+  const gToken = run(['config', 'get', 'token'])
+  assert.equal(gToken.code, 0)
+  assert.equal(gToken.stdout.trim(), fullToken.slice(0, 4) + '****', `长 token 打码：${gToken.stdout}`)
+  assert.ok(!gToken.stdout.includes(fullToken))
+
+  const a2b = run(['config', 'add-peer', 'P1', 'http://127.0.0.1:9', 'peer-secret-token-9'])
+  assert.equal(a2b.code, 0, a2b.stderr)
+  const gAll = run(['config', 'get'])
+  assert.equal(gAll.code, 0)
+  assert.ok(!gAll.stdout.includes(fullToken), 'config get 不含完整顶层 token')
+  assert.ok(!gAll.stdout.includes('peer-secret-token-9'), 'config get 不含完整 peer token')
+  assert.ok(gAll.stdout.includes('peer****'), 'peer token 打码展示')
+
+  // v1.4.1（B6）：带打码 peer token 的整组 peers 保存 → 真实 peer token 不丢
+  const b6c = run(['config', 'set', '{"peers":[{"name":"P1","url":"http://127.0.0.1:9","token":"peer****"}]}'])
+  assert.equal(b6c.code, 0, b6c.stderr)
+  saved = await readConfig()
+  assert.equal(saved.peers[0].token, 'peer-secret-token-9', '打码 peer token 保持原值')
+  assert.equal(saved.peers[0].name, 'P1')
+
+  const stTok = run(['status'])
+  assert.equal(stTok.code, 0, stTok.stderr)
+  assert.ok(!stTok.stdout.includes(fullToken), 'status 不含完整 token')
+  assert.ok(!stTok.stdout.includes('peer-secret-token-9'), 'status 不含完整 peer token')
+  assert.ok(stTok.stdout.includes('peer****'), 'status peers 打码展示')
+  console.log('cli S9（B7/B6）config get/status 全脱敏、打码 peers 保存不丢凭据 PASS')
+
+  // v1.4.1（B3）：请求已发出（连接已建立）后超时 → 「结果未知」，绝不回退离线更新
+  {
+    const http = await import('node:http')
+    const hang = http.createServer(() => { /* 接受连接但不响应 */ })
+    await new Promise((r) => hang.listen(0, '127.0.0.1', r))
+    const hangPort = hang.address().port
+    await fsp.writeFile(configFile, JSON.stringify({ listenPort: hangPort, token: 'cli-hang-token' }))
+    const updatesDir = path.join(dshSyncHome, 'updates')
+    const before = await fsp.readFile(configFile, 'utf8')
+    const hung = run(['update', 'apply', '--version', '9.9.9'], { DSH_SYNC_API_TIMEOUT_MS: '500' })
+    assert.equal(hung.code, 1, `超时命令应非零退出：${hung.stdout} ${hung.stderr}`)
+    assert.ok(hung.stderr.includes('结果未知'), `必须报结果未知：${hung.stderr}`)
+    assert.ok(!hung.stderr.includes('直接下载替换'), '超时不得回退离线下载')
+    assert.equal(await fsp.readFile(configFile, 'utf8'), before, '超时后本地 config 不被改动')
+    await assert.rejects(fsp.access(path.join(updatesDir, 'state.json')), '超时不触发离线更新（无 pending 状态）')
+    await new Promise((r) => hang.close(r))
+    console.log('cli S10（B3）请求后超时报结果未知、不触发离线更新 PASS')
+  }
   console.log('ALL PASS（bin/dsh-sync.mjs CLI 冒烟）')
 } finally {
   await fsp.rm(home, { recursive: true, force: true })

@@ -9,14 +9,14 @@ import os from 'node:os'
 import crypto from 'node:crypto'
 import { fileURLToPath } from 'node:url'
 import { readJson } from '../lib/util.js'
-import { DEFAULTS, deepMerge, publicSettings, saveConfig } from '../lib/config.js'
+import { DEFAULTS, deepMerge, publicSettings, sanitizeConfigSet, saveConfig } from '../lib/config.js'
 import { guardedMkdir } from '../lib/safe-writer.js'
 import { checkUpdate, applyUpdate } from '../lib/update.js'
 
 const pluginRoot = fileURLToPath(new URL('..', import.meta.url))
 const dataDir = process.env.DSH_SYNC_HOME || path.join(os.homedir(), '.dsh', 'plugin-sync')
 const configFile = path.join(dataDir, 'config.json')
-const API_TIMEOUT_MS = 10000
+const API_TIMEOUT_MS = Number(process.env.DSH_SYNC_API_TIMEOUT_MS) || 10000
 
 function usage() {
   return `dsh-plugin-sync CLI（v1.4.0）
@@ -73,7 +73,13 @@ async function installedVersion() {
   }
 }
 
-// 返回 null 表示服务不可用（网络层失败）；HTTP 错误返回 {ok:false,...}
+// 连接建立前失败（请求未送达、不可能有副作用）——可安全回退离线模式。
+// ECONNREFUSED 是典型；EADDRNOTAVAIL（如 listenPort=0）/ENOTFOUND 等同属此类。
+const PRE_CONNECT_CODES = new Set(['ECONNREFUSED', 'EADDRNOTAVAIL', 'ENOTFOUND', 'EACCES', 'EHOSTUNREACH', 'ENETUNREACH'])
+
+// 返回 null 仅表示「连接建立前失败」——可安全回退离线模式。
+// v1.4.1（B3）：请求已发出后的超时/断连视为「结果未知」，直接报错而不是回退离线重试
+// （写入类操作盲重试可能造成双写/状态错乱，必须先检查状态）。
 async function apiCall(pathname, init = {}) {
   const settings = await localSettings()
   const port = settings.listenPort ?? 8789
@@ -90,8 +96,13 @@ async function apiCall(pathname, init = {}) {
     let data = null
     try { data = text ? JSON.parse(text) : null } catch { data = { error: text } }
     return { ok: res.ok, status: res.status, data }
-  } catch {
-    return null
+  } catch (e) {
+    if (ac.signal.aborted) {
+      throw new Error(`管理 API ${pathname} 请求超时：结果未知，请检查服务状态后重试（${e?.message || e}）`)
+    }
+    const code = e?.cause?.code || e?.code || ''
+    if (PRE_CONNECT_CODES.has(code)) return null
+    throw new Error(`管理 API ${pathname} 请求失败：结果未知，请检查服务状态后重试（${e?.cause?.message || e?.message || e}）`)
   } finally {
     clearTimeout(timer)
   }
@@ -109,10 +120,12 @@ async function localWriteConfig(patch) {
 }
 
 async function mutateConfig(patch, description) {
+  // v1.4.1（B6）：打码/空 token 一律视为「不修改」，从 set 剔除；peers 打码 token 用本地真实值回填。
+  const clean = sanitizeConfigSet(patch, await localSettings())
   const res = await apiCall('/v1/admin/config', {
     method: 'PUT',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ set: patch }),
+    body: JSON.stringify({ set: clean }),
   })
   if (res) {
     if (!res.ok) {
@@ -122,7 +135,7 @@ async function mutateConfig(patch, description) {
     print(`${description} 完成。${res.data?.needRestart ? 'needRestart=true：listenPort/role/bindHost/token 变更，需重启 DSH 生效。' : '下一轮同步自动生效。'}`)
     return
   }
-  await localWriteConfig(patch)
+  await localWriteConfig(clean)
 }
 
 function validateRemapPath(p, label) {
@@ -162,14 +175,16 @@ async function main() {
       return
     }
     const settings = await localSettings()
+    // v1.4.1（B7）：本地摘要同样整体走 publicSettings（peers[].token 一并打码）。
+    const masked = publicSettings(settings)
     print({
       note: '管理服务未运行，以下为本地 config.json 摘要（重启 DSH 后可见完整状态）',
       installedVersion: await installedVersion(),
       deviceName: settings.deviceName || os.hostname(),
       role: settings.role,
       listenPort: settings.listenPort,
-      token: publicSettings(settings).token,
-      peers: settings.peers,
+      token: masked.token,
+      peers: masked.peers,
       hubUrl: settings.hubUrl,
       repo: settings.repo,
       updateCheck: settings.updateCheck,
@@ -179,7 +194,7 @@ async function main() {
   }
 
   if (cmd === 'sync') {
-    const res = await apiCall('/v1/admin/sync', { method: 'POST' })
+    const res = await apiCall('/v1/admin/sync', { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' })
     if (!res) throw new Error('管理服务未运行，无法触发同步（请先启动 DSH）')
     if (!res.ok) throw new Error(`管理 API 返回 HTTP ${res.status}：${res.data?.error || '未知错误'}`)
     print(res.data.started ? '已触发一轮同步（后台执行中）。' : `未触发：${res.data.reason === 'inFlight' ? '已有同步在进行中' : res.data.reason}`)
@@ -206,16 +221,40 @@ async function main() {
       return
     }
     if (sub === 'apply') {
-      const opts = { version: null, force: false }
+      const opts = { version: null, tag: null, force: false }
       for (let i = 0; i < rest.length; i++) {
         const arg = rest[i]
         if (arg === '--force') opts.force = true
         else if (arg === '--version' || arg.startsWith('--version=')) {
-          opts.version = arg.includes('=') ? arg.split('=').slice(1).join('=') : rest[++i]
+          const raw = arg.includes('=') ? arg.split('=').slice(1).join('=') : rest[++i]
+          opts.version = String(raw || '').trim()
+          // v1.4.1（N3）：用户显式带 v 前缀时按原始 tag 下载；裸 semver 保持默认 v{version}。
+          if (/^v\d/i.test(opts.version)) opts.tag = opts.version
         } else throw new Error(`未知参数：${arg}`)
       }
-      const payload = { force: opts.force }
-      if (opts.version) payload.version = opts.version.replace(/^v/, '')
+      // v1.4.1（N1）：不带 --version 时先检查更新，取 latest 再 apply；无更新则提示已最新。
+      let latestTag = opts.tag
+      if (!opts.version) {
+        const settings = await localSettings()
+        const current = await installedVersion()
+        let check
+        const cres = await apiCall('/v1/admin/update/check')
+        if (cres) {
+          if (!cres.ok) throw new Error(`管理 API 返回 HTTP ${cres.status}：${cres.data?.error || '未知错误'}`)
+          check = cres.data
+        } else {
+          check = await checkUpdate({ repo: settings.repo, currentVersion: current })
+        }
+        if (check.error) throw new Error(`检查更新失败：${check.error}`)
+        if (!check.available) {
+          print({ note: '已是最新版本', current, latest: check.latest || current })
+          return
+        }
+        opts.version = check.latest
+        latestTag = check.latestTag || latestTag
+      }
+      const payload = { force: opts.force, version: opts.version.replace(/^v/, '') }
+      if (latestTag) payload.tag = latestTag
       const res = await apiCall('/v1/admin/update/apply', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
@@ -230,6 +269,7 @@ async function main() {
         result = await applyUpdate({
           repo: settings.repo,
           version: payload.version,
+          tag: payload.tag,
           force: payload.force,
           installRoot: pluginRoot,
           dataDir,

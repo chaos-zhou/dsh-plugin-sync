@@ -414,3 +414,34 @@ Codex 审核 v1.3.0 指出：
 - Codex 探针发现：真实 GitHub tarball 含以 `/` 结尾的目录条目（如 `pkg/`、`pkg/lib/`），原 `isSafeTarName` 把尾部空段判为不安全导致解包失败。
 - 修复：目录条目先去掉尾部 `/` 再做安全校验；含 `..` 的目录条目仍拒绝。新增 `tests/update.test.mjs` D4/D5 用例。
 - 端到端验证：真实从 codeload 下载 v1.3.2 tarball → 安全解包（含目录条目）→ 备份 → 替换 → `restartRequired: true`，安装目录版本正确更新。
+
+## v1.4.1 安全加固（Codex 审核 7 BLOCKER + 3 NIT）
+
+日期：2026-11-09。范围冻结：只修 v1.4.0 审核问题，不新增功能。全部改动限于 `lib/config.js`、`lib/update.js`、`lib/server.js`、`lib/engine.js`、`lib/admin-html.js`、`bin/dsh-sync.mjs` 及对应测试；零依赖 ESM，未碰真实 `~/.dsh`，未执行 git commit。
+
+| 项目 | 修复位置与行为 | 对应测试 |
+|---|---|---|
+| B1 备份目录独占且写入走 safe-writer | `lib/update.js:385-402`：备份目录名加 `crypto.randomBytes(8)` 随机后缀，`fsp.mkdir(recursive:false, mode:0o700)` 独占创建（EEXIST/预置链接一律失败中止，替换前零副作用，且不清理非本进程创建的同名条目）；备份文件与 manifest 全部走 `guardedWrite({root: backupDir, dshHome})`。 | update H1（预置符号链接/重名目录 → 拒绝且宿主文件字节不变）、H2（成功路径备份目录 0o700） |
+| B2 回滚登记时序/权限/失败可恢复 | `lib/update.js:405-420`：先登记全部 planned `replaced/added` 再动手写（rename 后复核失败也能回滚当前文件）；manifest 提前到替换前写入备份目录（人工恢复有清单）；`rollback` 恢复原 mode（`stat.mode & 0o7777`，含执行位）；回滚失败返回 `backupDir`（非 null）并在 error 列出问题清单。 | update I1（注入 realpath 复核失败 → 旧内容+0o755 mode 保留、新增清理、无 pending）、J1（回滚失败 → backupDir 非空 + error 含问题 + 备份旧内容可查） |
+| B3 更新互斥 + CLI 超时语义 | `lib/update.js:326-341,458-460`：`dataDir/updates/.lock` 用 `fsp.open('wx', 0o600)` 独占创建、finally 删除；引擎自动更新（engine.applyUpdateNow）、admin 手动、CLI 直连共用 applyUpdate 内的锁。`bin/dsh-sync.mjs:78-106`：仅连接建立前失败（ECONNREFUSED/EADDRNOTAVAIL 等 PRE_CONNECT_CODES）回退离线；请求发出后超时/异常一律报「结果未知，请检查服务状态后重试」。 | update K1（并发双 apply：一个成功一个「已有更新在进行」、锁文件清理）、cli S10（挂起服务 + 超时 → 非零退出、无离线下载、config 不被改动） |
+| B4 解压上限 + 元数据条目计数 | `lib/update.js:356`：`gunzipSync(bytes, {maxOutputLength: MAX_TAR_TOTAL_BYTES+1})`，超限报「疑似 gzip 炸弹」；`:190-195`：所有 512 字节头（含 L/x/g/K）计入 `MAX_TAR_ENTRIES`，超限拒绝。 | update L1（65MiB 炸弹小包拒绝且零副作用）、M1（2001 个 g 元数据头拒绝） |
+| B5 管理端鉴权强化 | `lib/server.js:120-158`：socket 回环 → Host 头回环（防 DNS rebinding）→ token 仅认 `x-dsh-sync-token` 头（query token 一律拒绝）→ 非 GET 还要求 `content-type: application/json`（否则 415）且 `Origin`（若有）host 为回环（否则 403）；`GET /admin` 页面免 token（仅回环），`/v1/admin/*` 仍需 token；管理端与主 API 的 token 比较统一 sha256+`timingSafeEqual`（N2）。 | admin U1（query token 401、恶意 Host 403、text/plain 415、无 content-type 415、跨站 Origin 403、回环 Origin 放行、GET /admin 免 token 200）、U2 引擎层 401 |
+| B6 打码 token 不得回写 | `lib/config.js:64-95`：`looksMasked`（含 `*` 即视为打码串）+ `sanitizeConfigSet(set, current)`：顶层 token、`peers[].token` 打码/空串从 set 剔除，peers 整组替换场景下用当前配置真实值（同名优先、次同下标）回填，保证「只改其他字段保存」不丢凭据。接线：`engine.updateSettings`、admin PUT（引擎入口）、CLI `config set/add-peer/set-token/remap`（mutateConfig）。`admin-html.js` 增加打码提示，syncNow 带 JSON 头。 | admin U1（打码 token PUT 后内部 settings 不变）、U2 端到端（加载→只改 intervalSec→保存→token 与 peers token 保持原值、服务 200）、cli S3b（打码/空 token 不回写）、S9（打码 peer token 整组保存不丢） |
+| B7 凭据统一脱敏 | `lib/config.js:45-60`：`maskToken` 短 token（≤12）整体打码为 `********`、长 token 最多保留前 4 位；`publicSettings` 同时打码 `peers[].token`。`engine.status` 用 maskToken；CLI status 本地摘要整体走 publicSettings（peers 不再泄漏）；config get/status/admin API 输出全部打码。 | admin U1/U2（短 token `********`、输出不含完整 token）、cli S9（config get/status 全脱敏）、engine.test（长 token 前 4 位）、cli S3 |
+| N1 apply 默认最新 | `bin/dsh-sync.mjs:236-256`：`update apply` 不带 `--version` 时先 checkUpdate（API 或直连 GitHub），无更新提示「已是最新版本」退出 0，有更新取 latest 再 apply。 | admin U2（POST apply `{}` → 引擎默认取 latest → 低于当前版本被 force 拒绝，证明走了默认最新路径） |
+| N2 timingSafeEqual | 同 B5：`lib/server.js:39-43 tokensMatch`（sha256 归一定长后 `crypto.timingSafeEqual`），管理端与主 API 全部走该比较。 | admin U1/U2（错 token/无 token 401，行为不变） |
+| N3 latestTag/无 v 前缀 tag | `lib/update.js:81-110`：`checkUpdate` 返回 `latestTag`（保留原始 tag）；`applyUpdate` 接受 `tag` 参数（缺省 `v{version}`，tag 限定 `[\w.-]` 防注入），下载 URL 用原始 tag；`engine.applyUpdateNow`/CLI 均透传 latestTag。 | update A1/A2（latestTag 断言）、N1（无 v 前缀 tag 下载成功、URL 用 tag；缺省 v{version}）、admin U2 check.latestTag |
+
+## 验收命令与结果（实测，2026-11-09，Node v24.15.0 / macOS）
+
+- `node --check`：`lib/*.js`、`bin/*.mjs`、`index.js`、`hub.mjs`、`tests/*.test.mjs` 全部通过。
+- 10 套测试全绿：
+  1. `node tests/update.test.mjs` — 19 组 ALL PASS（含 B1/B2/B3/B4/N3 新增 9 组）；
+  2. `node tests/admin.test.mjs` — U1/U2/U3 ALL PASS（含 B5 鉴权矩阵、B6 端到端、B7 脱敏、N1 默认最新）；
+  3. `node tests/cli.test.mjs` — 12 组 ALL PASS（含 B3 挂起超时、B6 打码不回写、B7 全脱敏）；
+  4. `node tests/engine.test.mjs` — ALL PASS；5. `node tests/engine.offline.test.mjs` — ALL PASS；
+  6. `node tests/apply.compat.test.mjs` — ALL PASS；7. `node tests/fixture.accept.test.mjs` — ALL PASS；
+  8. `node tests/registry.test.mjs` — 12 组 ALL PASS；9. `node tests/security.symlink.test.mjs` — 14 组 ALL PASS；
+  10. `node tests/workspace.compat.test.mjs` — 15 组 ALL PASS。
+- 真实 tarball 端到端：真实 `api.github.com` checkUpdate（latest 1.3.2 / latestTag v1.3.2）→ codeload 下载真实 v1.3.2 tarball（含目录条目）→ 安全解包 → 独占随机备份目录（含 manifest）→ 白名单替换 → `restartRequired:true`、updates 仅剩备份+state.json。PASS。
+- grep 确认 B1-B7/N1-N3 全部有实现（备份独占 0o700/guardedWrite、planned 登记、.lock wx、maxOutputLength、timingSafeEqual/Host/Origin/Content-Type、looksMasked/sanitizeConfigSet、maskToken ≤12、latestTag）。
