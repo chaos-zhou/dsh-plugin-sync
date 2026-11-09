@@ -296,6 +296,35 @@ try {
   assert.equal(await read('index.js'), 'OLD-INDEX')
   console.log('update G1 下载失败零副作用 PASS')
 
+  // D4（v1.4.1）：真实 GitHub tarball 含目录条目（以 / 结尾），必须被接受
+  {
+    await makeInstall('1.3.2')
+    const tgz = buildTgz([
+      { name: 'pax_global_header', type: 'g', data: Buffer.from('52 comment=abc\n') },
+      { name: 'dsh-plugin-sync-1.4.0/', type: '5' },
+      { name: 'dsh-plugin-sync-1.4.0/lib/', type: '5' },
+      { name: 'dsh-plugin-sync-1.4.0/package.json', data: Buffer.from(JSON.stringify({ name: 'dsh-plugin-sync', version: '1.4.0' })) },
+      { name: 'dsh-plugin-sync-1.4.0/index.js', data: Buffer.from('NEW-INDEX-DIR') },
+      { name: 'dsh-plugin-sync-1.4.0/lib/engine.js', data: Buffer.from('NEW-ENGINE-DIR') },
+    ])
+    const res = await applyUpdate({ repo: 'chaos-zhou/dsh-plugin-sync', version: '1.4.0', installRoot, dataDir, fetchImpl: async () => new Response(tgz) })
+    assert.equal(res.error, null, '真实目录条目不应导致失败')
+    assert.equal(await read('index.js'), 'NEW-INDEX-DIR')
+    assert.equal(await read('lib/engine.js'), 'NEW-ENGINE-DIR')
+    console.log('update D4 真实 tar 目录条目（尾 /）被正确接受 PASS')
+  }
+  // D5：目录条目含 .. 仍拒绝
+  {
+    await makeInstall('1.3.2')
+    const tgz = buildTgz([
+      { name: 'dsh-plugin-sync-1.4.0/', type: '5' },
+      { name: 'dsh-plugin-sync-1.4.0/../evil/', type: '5' },
+    ])
+    const res = await applyUpdate({ repo: 'chaos-zhou/dsh-plugin-sync', version: '1.4.0', installRoot, dataDir, fetchImpl: async () => new Response(tgz) })
+    assert.ok(res.error && /不安全/.test(res.error), '含 .. 的目录条目必须被拒绝')
+    console.log('update D5 目录条目含 .. 仍拒绝 PASS')
+  }
+
   console.log('ALL PASS（lib/update.js：checkUpdate/applyUpdate/安全解包/备份回滚/pending）')
 } finally {
   await fsp.rm(home, { recursive: true, force: true })

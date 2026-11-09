@@ -409,3 +409,8 @@ Codex 审核 v1.3.0 指出：
 - 新增 `tests/admin.test.mjs`（单元层：401/403 顺序、HTML 关键中文文案、config 读写与 400、sync started/inFlight、mock 更新检查与应用替换、全路由 no-store；engine 层：status 新字段、config 持久化与 needRestart、sync→lastRun、update check 缓存进 status、低版本拒绝；pending 版本不符保留、运行版本追上自动清除）。
 - 新增 `tests/cli.test.mjs`（8 组冒烟：version/help、config get 默认值、set 深合并持久化、get key/不存在、add/remove-peer、set-token 生成、set-remap/remove-remap 与非法路径拒绝、status 本地摘要、sync 未运行非零退出、未知命令报错；临时 DSH_SYNC_HOME + listenPort=0 确定性回退）。
 - 既有 7 套测试保持全绿；`node --check` 全部改动文件通过。
+
+## v1.4.0 补充修复：真实 tarball 目录条目
+- Codex 探针发现：真实 GitHub tarball 含以 `/` 结尾的目录条目（如 `pkg/`、`pkg/lib/`），原 `isSafeTarName` 把尾部空段判为不安全导致解包失败。
+- 修复：目录条目先去掉尾部 `/` 再做安全校验；含 `..` 的目录条目仍拒绝。新增 `tests/update.test.mjs` D4/D5 用例。
+- 端到端验证：真实从 codeload 下载 v1.3.2 tarball → 安全解包（含目录条目）→ 备份 → 替换 → `restartRequired: true`，安装目录版本正确更新。
